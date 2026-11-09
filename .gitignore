@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Local runtime data & app window profile
+data/
+.len-nui-app-profile/
+*.db
+*.sqlite
+
+# Windows machine-specific shortcuts & OS files
+*.lnk
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*

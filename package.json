@@ -1,0 +1,28 @@
+{
+  "name": "len-nui-ascend-desktop",
+  "version": "1.2.0",
+  "description": "LÊN NÚI (Ascend The Mountain) - Hệ thống kỷ luật cá nhân cực đoan & Bí Kíp Tu Luyện trên Desktop (Shanshui Zen Edition)",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "dev": "node scripts/build.mjs && node scripts/desktop-server.mjs",
+    "start": "node scripts/build.mjs && node scripts/desktop-server.mjs",
+    "electron": "node scripts/build.mjs && electron ."
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "wait-on": "^8.0.1"
+  }
+}
