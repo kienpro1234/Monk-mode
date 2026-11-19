@@ -1,22 +1,68 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { execFile, spawn } from 'child_process';
+import {
+  evaluatePendingDays,
+  getCurrentPendingObligations,
+  getEffectiveNightStartTime,
+  getLawConfig,
+  getShiftDateStr,
+} from './lawEngine.mjs';
 
-const ROOT = process.cwd();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ROOT = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(ROOT, 'dist');
-const DATA_DIR = path.join(ROOT, 'data');
+const DATA_DIR = process.env.LEN_NUI_DATA_DIR
+  ? path.resolve(process.env.LEN_NUI_DATA_DIR)
+  : path.join(ROOT, 'data');
+const DAEMON_LOG_PATH = path.join(DATA_DIR, 'daemon.log');
 const PROFILE_DIR = path.join(DATA_DIR, 'desktop-window-profile');
 const DB_PATH = path.join(DATA_DIR, 'len-nui-db.json');
+const DB_BACKUP_PATH = path.join(DATA_DIR, 'len-nui-db.backup.json');
+const HEARTBEAT_PATH = path.join(DATA_DIR, 'heartbeat.json');
+const TRAY_STATUS_PATH = path.join(DATA_DIR, 'tray-status.json');
+const TRAY_NOTIFY_PATH = path.join(DATA_DIR, 'tray-notify.json');
 const WALLPAPER_BACKUP_META = path.join(DATA_DIR, 'wallpaper-backup.json');
 const ACTIVE_WALLPAPER_PATH = path.join(DATA_DIR, 'monk-active-wallpaper.png');
 const SCREEN_CAPTURE_PATH = path.join(DATA_DIR, 'live-screen-capture.png');
-const PREFERRED_PORT = Number(process.env.PORT || 5173);
+const START_BG_VBS = path.join(ROOT, 'scripts', 'Start-Background.vbs');
+const TRAY_PS1_PATH = path.join(ROOT, 'scripts', 'tray-helper.ps1');
 
+const PREFERRED_PORT = Number(process.env.PORT || 5173);
+const IS_BACKGROUND =
+  process.argv.includes('--background') || process.env.LEN_NUI_BACKGROUND === 'true';
+const NO_WINDOW = process.env.NO_WINDOW === 'true';
+const NO_TRAY = process.env.NO_TRAY === 'true';
+const SKIP_OS_SIDE_EFFECTS = process.env.SKIP_OS_SIDE_EFFECTS === 'true';
+const REGISTRY_RUN_KEY = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const REGISTRY_VALUE_NAME = 'LenNuiMonkMode';
+const PROOFS_DIR = path.join(DATA_DIR, 'proofs');
+const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
+
+export function isAllowedLocalOrigin(origin) {
+  if (!origin) return true;
+  const trimmed = String(origin).trim();
+  if (!trimmed || trimmed === 'null') return true;
+  return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(trimmed);
+}
+
+let actualPort = PREFERRED_PORT;
+const startedAt = Date.now();
+let lastHeartbeatAt = 0;
+let lastEvaluationAt = 0;
+let dbUpdatedAt = 0;
 let isMonkModeLocked = false;
 let isAlarmHijackActive = false;
 let processGuardEnabled = false;
 let activeWhitelist = [];
+let trayChild = null;
+let watchdogTimer = null;
+let lastReminderSent = { shiftDateStr: '', thirtyMin: false, tenMin: false };
+let lastScheduleNotified = { shiftDateStr: '', notifiedKeys: new Set() };
+let mockAutoStartEnabled = true;
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -25,6 +71,454 @@ function ensureDataDir() {
   if (!fs.existsSync(PROFILE_DIR)) {
     fs.mkdirSync(PROFILE_DIR, { recursive: true });
   }
+}
+
+function logDaemon(message) {
+  try {
+    ensureDataDir();
+    const line = `[${new Date().toISOString()}] ${message}\r\n`;
+    if (fs.existsSync(DAEMON_LOG_PATH) && fs.statSync(DAEMON_LOG_PATH).size > 65536) {
+      fs.writeFileSync(DAEMON_LOG_PATH, line, 'utf-8');
+    } else {
+      fs.appendFileSync(DAEMON_LOG_PATH, line, 'utf-8');
+    }
+  } catch {
+    // Ignore log error
+  }
+}
+
+function readJsonSafe(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonAtomic(filePath, data) {
+  ensureDataDir();
+  const content = JSON.stringify(data, null, 2);
+  const tmpPath = `${filePath}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmpPath, content, 'utf-8');
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup error
+    }
+    fs.writeFileSync(filePath, content, 'utf-8');
+  }
+}
+
+let lastDbBackupAt = 0;
+
+function getDbRichnessScore(db) {
+  if (!db || typeof db !== 'object') return 0;
+  const goals = Array.isArray(db.peakGoals) ? db.peakGoals.length : 0;
+  const milestones = Array.isArray(db.peakGoals)
+    ? db.peakGoals.reduce((s, g) => s + (Array.isArray(g?.milestones) ? g.milestones.length : 0), 0)
+    : 0;
+  const ritualItems = Array.isArray(db.ritualGroups)
+    ? db.ritualGroups.reduce((s, g) => s + (Array.isArray(g?.items) ? g.items.length : 0), 0)
+    : 0;
+  const defaultGroupIds = new Set(['ritual-grp-morning', 'ritual-grp-return-home', 'ritual-grp-study-desk']);
+  const customGroups = Array.isArray(db.ritualGroups)
+    ? db.ritualGroups.filter((g) => g && !defaultGroupIds.has(g.id)).length
+    : 0;
+  const strikes = Array.isArray(db.dailyStrikes) ? db.dailyStrikes.length : 0;
+  const violations = Array.isArray(db.violations) ? db.violations.length : 0;
+  const journals = Array.isArray(db.reflectionJournals) ? db.reflectionJournals.length : 0;
+  const scrolls = Array.isArray(db.sacredScrolls) ? db.sacredScrolls.length : 0;
+  const sideQuests = Array.isArray(db.session?.sideQuests) ? db.session.sideQuests.length : 0;
+  const optNotes = Array.isArray(db.optimizationNotes) ? db.optimizationNotes.length : 0;
+  const hasSchedule = db.climbingSchedulePlan && Array.isArray(db.climbingSchedulePlan.days) ? 1 : 0;
+  return (
+    goals * 1000 +
+    milestones * 100 +
+    ritualItems * 50 +
+    strikes * 30 +
+    violations * 20 +
+    journals * 15 +
+    scrolls * 15 +
+    sideQuests * 10 +
+    customGroups * 10 +
+    optNotes * 10 +
+    hasSchedule * 25
+  );
+}
+
+function isEssentiallyEmptyDb(db) {
+  if (!db || typeof db !== 'object' || !db.session) return true;
+  return getDbRichnessScore(db) === 0;
+}
+
+function extractBalancedJsonObject(str, startIndex) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  const maxEnd = Math.min(str.length, startIndex + 2_000_000);
+  for (let i = startIndex; i < maxEnd; i++) {
+    const ch = str[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return str.slice(startIndex, i + 1);
+    }
+  }
+  return null;
+}
+
+function tryRecoverFromChromiumLevelDb() {
+  try {
+    if (fs.existsSync(DB_PATH)) return false;
+    const levelDbDir = path.join(PROFILE_DIR, 'Default', 'Local Storage', 'leveldb');
+    if (!fs.existsSync(levelDbDir)) return false;
+
+    const files = fs
+      .readdirSync(levelDbDir)
+      .filter((name) => name.endsWith('.log') || name.endsWith('.ldb'))
+      .map((name) => path.join(levelDbDir, name));
+
+    const candidates = [];
+    for (const filePath of files) {
+      let buf;
+      try {
+        buf = fs.readFileSync(filePath);
+      } catch {
+        continue;
+      }
+      const views = [
+        buf.toString('utf16le'),
+        buf.length > 1 ? buf.subarray(1).toString('utf16le') : '',
+        buf.toString('utf8'),
+      ];
+      for (const text of views) {
+        if (!text) continue;
+        let idx = 0;
+        while (true) {
+          const start = text.indexOf('{"session":', idx);
+          if (start === -1) break;
+          const jsonStr = extractBalancedJsonObject(text, start);
+          if (jsonStr) {
+            try {
+              const parsed = JSON.parse(jsonStr);
+              if (parsed?.session?.id && Array.isArray(parsed.peakGoals)) {
+                candidates.push(parsed);
+              }
+            } catch {
+              // Skip split/corrupted record
+            }
+          }
+          idx = start + 11;
+        }
+      }
+    }
+
+    if (candidates.length === 0) return false;
+    candidates.sort((a, b) => {
+      const diff = getDbRichnessScore(b) - getDbRichnessScore(a);
+      if (diff !== 0) return diff;
+      return (b.session?.lastActiveAt || 0) - (a.session?.lastActiveAt || 0);
+    });
+
+    const best = candidates[0];
+    if (getDbRichnessScore(best) <= 0) return false;
+    writeJsonAtomic(DB_PATH, best);
+    logDaemon(
+      `Auto-recovered user DB from Chromium LevelDB (session=${best.session.id}, score=${getDbRichnessScore(best)})`
+    );
+    return true;
+  } catch (err) {
+    logDaemon(`Chromium LevelDB auto-recovery error: ${String(err)}`);
+    return false;
+  }
+}
+
+function ensureProofsDir() {
+  ensureDataDir();
+  if (!fs.existsSync(PROOFS_DIR)) {
+    fs.mkdirSync(PROOFS_DIR, { recursive: true });
+  }
+}
+
+function getProofExtFromMime(mime) {
+  const lower = String(mime || '').toLowerCase();
+  if (lower.includes('png')) return '.png';
+  if (lower.includes('webp')) return '.webp';
+  return '.jpg';
+}
+
+function saveProofDataUrlToFile(dataUrl, prefix = 'pow') {
+  if (typeof dataUrl !== 'string') return dataUrl;
+  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/i.exec(dataUrl.trim());
+  if (!match) return dataUrl;
+  ensureProofsDir();
+  const ext = getProofExtFromMime(match[1]);
+  const safePrefix =
+    String(prefix || 'pow')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 24) || 'pow';
+  const unique = `${safePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+  const filePath = path.join(PROOFS_DIR, unique);
+  fs.writeFileSync(filePath, Buffer.from(match[2], 'base64'));
+  return unique;
+}
+
+function extractEmbeddedProofsFromDb(db) {
+  if (!db || typeof db !== 'object') return { db, migratedCount: 0 };
+  let migratedCount = 0;
+
+  const processStrike = (s) => {
+    if (!s || typeof s !== 'object') return s;
+    let changed = false;
+    let nextPhotoUri = s.proofPhotoUri;
+    if (typeof nextPhotoUri === 'string' && nextPhotoUri.startsWith('data:image/')) {
+      nextPhotoUri = saveProofDataUrlToFile(nextPhotoUri, 'pow');
+      migratedCount++;
+      changed = true;
+    }
+    let nextList = s.proofPhotosList;
+    if (Array.isArray(nextList)) {
+      let listChanged = false;
+      const mapped = nextList.map((p) => {
+        if (p && typeof p.uri === 'string' && p.uri.startsWith('data:image/')) {
+          migratedCount++;
+          listChanged = true;
+          return { ...p, uri: saveProofDataUrlToFile(p.uri, 'pow') };
+        }
+        return p;
+      });
+      if (listChanged) {
+        nextList = mapped;
+        changed = true;
+      }
+    }
+    return changed ? { ...s, proofPhotoUri: nextPhotoUri, proofPhotosList: nextList } : s;
+  };
+
+  const nextStrikes = Array.isArray(db.dailyStrikes) ? db.dailyStrikes.map(processStrike) : db.dailyStrikes;
+
+  const nextScrolls = Array.isArray(db.sacredScrolls)
+    ? db.sacredScrolls.map((sc) => {
+        if (!sc || typeof sc.snapshotJson !== 'string' || !sc.snapshotJson.includes('data:image/')) {
+          return sc;
+        }
+        try {
+          const snap = JSON.parse(sc.snapshotJson);
+          if (Array.isArray(snap.strikes)) {
+            snap.strikes = snap.strikes.map(processStrike);
+            return { ...sc, snapshotJson: JSON.stringify(snap) };
+          }
+        } catch {
+          // Ignore malformed snapshot
+        }
+        return sc;
+      })
+    : db.sacredScrolls;
+
+  if (migratedCount === 0) return { db, migratedCount: 0 };
+  return {
+    db: {
+      ...db,
+      dailyStrikes: nextStrikes,
+      sacredScrolls: nextScrolls,
+    },
+    migratedCount,
+  };
+}
+
+function writeRotatingBackup(dbObj) {
+  try {
+    ensureDataDir();
+    if (!fs.existsSync(BACKUPS_DIR)) {
+      fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+    }
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    const hh = String(now.getHours()).padStart(2, '0');
+    const filePath = path.join(BACKUPS_DIR, `len-nui-db-${y}-${m}-${d}_${hh}.json`);
+    writeJsonAtomic(filePath, dbObj);
+
+    const files = fs
+      .readdirSync(BACKUPS_DIR)
+      .filter((f) => f.startsWith('len-nui-db-') && f.endsWith('.json'))
+      .map((f) => ({
+        name: f,
+        fullPath: path.join(BACKUPS_DIR, f),
+        mtimeMs: fs.statSync(path.join(BACKUPS_DIR, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    for (let i = 7; i < files.length; i++) {
+      try {
+        fs.unlinkSync(files[i].fullPath);
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
+  } catch (err) {
+    logDaemon(`Rotating backup write warning: ${String(err)}`);
+  }
+}
+
+function normalizeProofBasename(uri) {
+  if (!uri || typeof uri !== 'string') return null;
+  const trimmed = uri.trim();
+  if (!trimmed || /^(data:|https?:|blob:|file:)/i.test(trimmed)) return null;
+  const stripped = trimmed.replace(/^\/?api\/proofs\//i, '').replace(/^\/+/, '');
+  const base = path.basename(stripped);
+  return base && base !== '.' && base !== '..' ? base : null;
+}
+
+function collectReferencedProofNames(db) {
+  const referenced = new Set();
+  if (!db || typeof db !== 'object') return referenced;
+
+  const inspectStrike = (s) => {
+    if (!s || typeof s !== 'object') return;
+    const mainName = normalizeProofBasename(s.proofPhotoUri);
+    if (mainName) referenced.add(mainName);
+    if (Array.isArray(s.proofPhotosList)) {
+      for (const item of s.proofPhotosList) {
+        const nm = normalizeProofBasename(item?.uri);
+        if (nm) referenced.add(nm);
+      }
+    }
+  };
+
+  if (Array.isArray(db.dailyStrikes)) {
+    for (const s of db.dailyStrikes) inspectStrike(s);
+  }
+  if (Array.isArray(db.sacredScrolls)) {
+    for (const sc of db.sacredScrolls) {
+      if (!sc || typeof sc.snapshotJson !== 'string') continue;
+      try {
+        const snap = JSON.parse(sc.snapshotJson);
+        if (Array.isArray(snap?.strikes)) {
+          for (const s of snap.strikes) inspectStrike(s);
+        }
+      } catch {
+        // Ignore malformed snapshot
+      }
+    }
+  }
+  return referenced;
+}
+
+function cleanupOrphanProofsOnDisk(db) {
+  ensureProofsDir();
+  const referenced = collectReferencedProofNames(db);
+  let removedCount = 0;
+  let freedBytes = 0;
+  const entries = fs.readdirSync(PROOFS_DIR);
+  for (const entry of entries) {
+    const fullPath = path.join(PROOFS_DIR, entry);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile()) continue;
+      if (!referenced.has(entry)) {
+        freedBytes += stat.size;
+        fs.unlinkSync(fullPath);
+        removedCount++;
+      }
+    } catch {
+      // Ignore single-file error
+    }
+  }
+  return { ok: true, removedCount, freedBytes, remainingCount: Math.max(0, entries.length - removedCount) };
+}
+
+function stripApiKeysFromDb(rawDb) {
+  const cloned = JSON.parse(JSON.stringify(rawDb));
+  if (cloned?.climbingSchedulePlan) {
+    delete cloned.climbingSchedulePlan.geminiApiKey;
+    delete cloned.climbingSchedulePlan.externalApiKeys;
+  }
+  if (Array.isArray(cloned?.savedScheduleProfiles)) {
+    for (const p of cloned.savedScheduleProfiles) {
+      if (p?.plan) {
+        delete p.plan.geminiApiKey;
+        delete p.plan.externalApiKeys;
+      }
+    }
+  }
+  return cloned;
+}
+
+function buildPortableBackupBundle(rawDb, includeApiKeys = false) {
+  const dbCopy = includeApiKeys ? JSON.parse(JSON.stringify(rawDb)) : stripApiKeysFromDb(rawDb);
+  const referenced = collectReferencedProofNames(dbCopy);
+  const embeddedProofs = {};
+  if (fs.existsSync(PROOFS_DIR)) {
+    for (const fileName of referenced) {
+      const fullPath = path.join(PROOFS_DIR, fileName);
+      try {
+        if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) continue;
+        const ext = path.extname(fileName).toLowerCase();
+        const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+        const b64 = fs.readFileSync(fullPath).toString('base64');
+        embeddedProofs[fileName] = `data:${mime};base64,${b64}`;
+      } catch {
+        // Skip unreadable image
+      }
+    }
+  }
+  return {
+    format: 'LEN_NUI_PORTABLE_BACKUP_V1',
+    exportedAt: Date.now(),
+    includesApiKeys: Boolean(includeApiKeys),
+    db: dbCopy,
+    embeddedProofs,
+  };
+}
+
+function restorePortableBackupBundle(payload) {
+  const incomingRawDb = payload?.db;
+  if (!incomingRawDb || !incomingRawDb.session || !Array.isArray(incomingRawDb.peakGoals)) {
+    return { ok: false, error: 'Dữ liệu sao lưu không hợp lệ.' };
+  }
+  ensureProofsDir();
+  let restoredProofsCount = 0;
+  const embedded = payload?.embeddedProofs;
+  if (embedded && typeof embedded === 'object') {
+    for (const [rawName, dataUrl] of Object.entries(embedded)) {
+      const safeName = path.basename(String(rawName || '').trim());
+      if (!safeName || safeName !== rawName || safeName.includes('..')) continue;
+      if (typeof dataUrl !== 'string') continue;
+      const match = /^data:image\/[a-zA-Z0-9.+-]+;base64,([\s\S]+)$/i.exec(dataUrl.trim());
+      if (!match) continue;
+      try {
+        fs.writeFileSync(path.join(PROOFS_DIR, safeName), Buffer.from(match[1], 'base64'));
+        restoredProofsCount++;
+      } catch {
+        // Ignore single proof write failure
+      }
+    }
+  }
+  const extracted = extractEmbeddedProofsFromDb(incomingRawDb);
+  const finalDb = extracted.db;
+  writeJsonAtomic(DB_PATH, finalDb);
+  dbUpdatedAt = Date.now();
+  return { ok: true, db: finalDb, restoredProofsCount };
 }
 
 function runPowerShell(script) {
@@ -42,6 +536,294 @@ function runPowerShell(script) {
       }
     );
   });
+}
+
+function pushTrayNotification(title, body, level = 'info') {
+  if (NO_TRAY) return;
+  try {
+    writeJsonAtomic(TRAY_NOTIFY_PATH, {
+      ts: Date.now(),
+      title,
+      body,
+      level,
+    });
+  } catch {
+    // Ignore
+  }
+}
+
+function formatHHMM(ms) {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function updateTrayStatus(db, pendingInfo) {
+  try {
+    const streak = db?.session?.currentStreak ?? 0;
+    const pendingCount = pendingInfo?.findings?.length ?? 0;
+    const cutoffStr = pendingInfo?.cutoffMs ? formatHHMM(pendingInfo.cutoffMs) : '23:59';
+    const menuLabel = db?.session
+      ? `Streak: ${streak} ngày | Việc còn lại: ${pendingCount} (Chốt ${cutoffStr})`
+      : 'Lên Núi — Chưa có phiên hoạt động';
+    const tooltip = db?.session
+      ? `Lên Núi • Streak ${streak}d • Còn ${pendingCount} mục`
+      : 'Lên Núi — Đang chạy nền';
+    const summaryTitle =
+      pendingCount > 0
+        ? `Còn ${pendingCount} hạng mục trước ${cutoffStr}`
+        : `Hôm nay sạch sẽ! (Streak ${streak} ngày)`;
+    const summaryBody =
+      pendingCount > 0
+        ? pendingInfo.findings.map((f) => f.reason).join(' ')
+        : `Còn ${pendingInfo?.minutesLeft ?? 0} phút đến giờ chốt sổ (${cutoffStr}). Giữ vững kỷ luật!`;
+
+    writeJsonAtomic(TRAY_STATUS_PATH, {
+      updatedAt: Date.now(),
+      streak,
+      pendingCount,
+      cutoffStr,
+      menuLabel,
+      tooltip,
+      summaryTitle,
+      summaryBody,
+    });
+  } catch {
+    // Ignore
+  }
+}
+
+function recordHeartbeat(nowMs, maxObs) {
+  lastHeartbeatAt = nowMs;
+  const prev = readJsonSafe(HEARTBEAT_PATH);
+  const nextMax = Math.max(nowMs, maxObs || 0, prev?.maxObservedAt || 0, prev?.lastActiveAt || 0);
+  writeJsonAtomic(HEARTBEAT_PATH, {
+    lastActiveAt: nowMs,
+    maxObservedAt: nextMax,
+    pid: process.pid,
+  });
+}
+
+function flushShutdownTimestamps() {
+  try {
+    const now = Date.now();
+    const hb = readJsonSafe(HEARTBEAT_PATH);
+    const maxObs = Math.max(now, hb?.maxObservedAt || 0, hb?.lastActiveAt || 0);
+    recordHeartbeat(now, maxObs);
+    const db = readJsonSafe(DB_PATH);
+    if (db && db.session) {
+      db.session.lastActiveAt = now;
+      db.session.maxObservedAt = Math.max(now, db.session.maxObservedAt || 0, maxObs);
+      writeJsonAtomic(DB_PATH, db);
+    }
+  } catch {
+    // Ignore during shutdown
+  }
+}
+
+/**
+ * Đọc DB & xét duyệt các ngày còn tồn đọng TRƯỚC khi ghi đè lastActiveAt = now,
+ * nhằm phát hiện chính xác trường hợp người dùng tắt máy trước giờ chốt sổ hôm trước.
+ */
+function runBackgroundEvaluation(triggerReason = 'watchdog') {
+  ensureDataDir();
+  const now = Date.now();
+  const hb = readJsonSafe(HEARTBEAT_PATH);
+  const rawDb = readJsonSafe(DB_PATH);
+
+  if (!rawDb || !rawDb.session) {
+    recordHeartbeat(now, now);
+    updateTrayStatus(null, null);
+    return { db: null, evaluated: false };
+  }
+
+  // Tự động tách ảnh Proof-of-Work Base64 cũ ra thư mục data/proofs/ nếu còn tồn đọng
+  const extracted = extractEmbeddedProofsFromDb(rawDb);
+  const cleanRawDb = extracted.db;
+
+  // Khôi phục lastActiveAt & maxObservedAt mới nhất từ heartbeat.json nếu DB chưa kịp ghi trước lúc sập nguồn
+  const hydratedDb = {
+    ...cleanRawDb,
+    session: {
+      ...cleanRawDb.session,
+      lastActiveAt: Math.max(cleanRawDb.session.lastActiveAt || 0, hb?.lastActiveAt || 0) || cleanRawDb.session.startTime || now,
+      maxObservedAt: Math.max(
+        cleanRawDb.session.maxObservedAt || 0,
+        hb?.maxObservedAt || 0,
+        cleanRawDb.session.lastActiveAt || 0
+      ),
+    },
+  };
+
+  isMonkModeLocked = Boolean(hydratedDb.session.isMonkModeOn);
+
+  const config = getLawConfig(hydratedDb);
+  const todayShiftStr = getShiftDateStr(
+    now,
+    config.workShiftMode,
+    getEffectiveNightStartTime(config)
+  );
+  const evalRes = evaluatePendingDays(hydratedDb, todayShiftStr, now);
+  lastEvaluationAt = now;
+
+  let activeDb = evalRes.db;
+  if (evalRes.changed || extracted.migratedCount > 0) {
+    activeDb = {
+      ...activeDb,
+      session: {
+        ...activeDb.session,
+        lastActiveAt: now,
+        maxObservedAt: Math.max(now, activeDb.session.maxObservedAt || 0),
+      },
+    };
+    writeJsonAtomic(DB_PATH, activeDb);
+    dbUpdatedAt = now;
+
+    if (evalRes.newViolations.length > 0) {
+      const offlineNote = evalRes.offlineReport?.missedDeadlineWhileOffline
+        ? ' (Phát hiện tắt máy trước giờ chốt sổ)'
+        : '';
+      pushTrayNotification(
+        `Lên Núi — Phát hiện ${evalRes.newViolations.length} vi phạm${offlineNote}`,
+        evalRes.newViolations[0]?.reason || 'Bạn có ngày chưa hoàn thành nghĩa vụ Luật Núi.',
+        'error'
+      );
+      if (activeDb.session.autoOpenOnViolation !== false && !NO_WINDOW) {
+        focusOrLaunchDesktopWindow(`http://127.0.0.1:${actualPort}`);
+      }
+    } else if (evalRes.cleanDays.length > 0) {
+      pushTrayNotification(
+        'Lên Núi — Chốt ngày sạch sẽ!',
+        `Hoàn thành trọn vẹn ${evalRes.cleanDays.length} ngày qua. Streak hiện tại: ${activeDb.session.currentStreak} ngày.`,
+        'info'
+      );
+    }
+  }
+
+  // Cập nhật heartbeat mới nhất SAU khi đánh giá bù xong
+  recordHeartbeat(now, activeDb.session.maxObservedAt || now);
+
+  // Kiểm tra nghĩa vụ hôm nay & gửi nhắc nhở trước giờ chốt sổ (30p & 10p)
+  const pendingInfo = getCurrentPendingObligations(activeDb, now);
+  updateTrayStatus(activeDb, pendingInfo);
+
+  if (triggerReason === 'watchdog' && pendingInfo.findings.length > 0) {
+    if (lastReminderSent.shiftDateStr !== pendingInfo.shiftDateStr) {
+      lastReminderSent = { shiftDateStr: pendingInfo.shiftDateStr, thirtyMin: false, tenMin: false };
+    }
+    const cutoffStr = formatHHMM(pendingInfo.cutoffMs);
+    if (pendingInfo.minutesLeft <= 10 && !lastReminderSent.tenMin) {
+      lastReminderSent.tenMin = true;
+      lastReminderSent.thirtyMin = true;
+      pushTrayNotification(
+        `KHẨN: Còn ${pendingInfo.minutesLeft} phút trước giờ chốt (${cutoffStr})!`,
+        `Vẫn còn ${pendingInfo.findings.length} mục Luật Núi chưa hoàn thành. Hoàn thành ngay kẻo mất Streak!`,
+        'warning'
+      );
+    } else if (pendingInfo.minutesLeft <= 30 && !lastReminderSent.thirtyMin) {
+      lastReminderSent.thirtyMin = true;
+      pushTrayNotification(
+        `Nhắc nhở: Còn ${pendingInfo.minutesLeft} phút đến giờ chốt (${cutoffStr})`,
+        `Bạn còn ${pendingInfo.findings.length} mục chưa xong hôm nay.`,
+        'warning'
+      );
+    }
+  }
+
+  // Nhắc đúng khung giờ Lịch Trình AI & Khóa cứng 1 tiếng trước giờ đi làm
+  if (triggerReason === 'watchdog' && Array.isArray(activeDb?.climbingSchedulePlan?.days)) {
+    if (lastScheduleNotified.shiftDateStr !== todayShiftStr) {
+      lastScheduleNotified = { shiftDateStr: todayShiftStr, notifiedKeys: new Set() };
+    }
+    const [sy, sm, sd] = todayShiftStr.split('-').map(Number);
+    const shiftDow = new Date(sy, sm - 1, sd, 12).getDay();
+    const todaySchedule = activeDb.climbingSchedulePlan.days.find((d) => d.dayOfWeek === shiftDow);
+    if (todaySchedule && Array.isArray(todaySchedule.slots)) {
+      const nowDate = new Date(now);
+      const nowMins = nowDate.getHours() * 60 + nowDate.getMinutes();
+      for (const slot of todaySchedule.slots) {
+        if (!slot || !slot.id || !slot.startTime) continue;
+        if (lastScheduleNotified.notifiedKeys.has(slot.id)) continue;
+        const parts = String(slot.startTime).split(':').map(Number);
+        if (parts.length !== 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) continue;
+        const startMins = parts[0] * 60 + parts[1];
+        if (slot.kind === 'CLIMB' && nowMins >= startMins - 5 && nowMins <= startMins + 2) {
+          lastScheduleNotified.notifiedKeys.add(slot.id);
+          pushTrayNotification(
+            `⏰ Sắp tới giờ leo núi (${slot.startTime}–${slot.endTime})`,
+            `${slot.title}${slot.suggestedTask ? ` — ${slot.suggestedTask}` : ''}`,
+            'info'
+          );
+        } else if (slot.kind === 'PREP_WORK' && nowMins >= startMins - 2 && nowMins <= startMins + 3) {
+          lastScheduleNotified.notifiedKeys.add(slot.id);
+          pushTrayNotification(
+            `🎒 KHÓA CỨNG 1 TIẾNG ĐI LÀM (${slot.startTime}–${slot.endTime})`,
+            'Dừng leo núi ngay! Ăn uống, chuẩn bị tư trang và di chuyển đi làm đúng giờ.',
+            'warning'
+          );
+        }
+      }
+    }
+  }
+
+  return { db: activeDb, evaluated: evalRes.changed, evalRes };
+}
+
+async function getWindowsAutoStartStatus() {
+  if (SKIP_OS_SIDE_EFFECTS) {
+    return {
+      ok: true,
+      enabled: mockAutoStartEnabled,
+      command: `wscript.exe "${START_BG_VBS}"`,
+      scriptPath: START_BG_VBS,
+      simulated: true,
+    };
+  }
+  const ps = `
+$val = (Get-ItemProperty -Path '${REGISTRY_RUN_KEY}' -Name '${REGISTRY_VALUE_NAME}' -ErrorAction SilentlyContinue).'${REGISTRY_VALUE_NAME}'
+if ($val) { Write-Output $val }
+`;
+  const res = await runPowerShell(ps);
+  const currentCmd = res.stdout || '';
+  return {
+    ok: res.ok,
+    enabled: Boolean(currentCmd),
+    command: currentCmd || `wscript.exe "${START_BG_VBS}"`,
+    scriptPath: START_BG_VBS,
+  };
+}
+
+async function setWindowsAutoStart(enabled) {
+  const commandStr = `wscript.exe "${START_BG_VBS}"`;
+  if (SKIP_OS_SIDE_EFFECTS) {
+    mockAutoStartEnabled = Boolean(enabled);
+    return {
+      ok: true,
+      enabled: mockAutoStartEnabled,
+      command: commandStr,
+      scriptPath: START_BG_VBS,
+      simulated: true,
+    };
+  }
+
+  const escapedCmd = commandStr.replace(/'/g, "''");
+  const ps = enabled
+    ? `
+New-Item -Path '${REGISTRY_RUN_KEY}' -Force | Out-Null
+Set-ItemProperty -Path '${REGISTRY_RUN_KEY}' -Name '${REGISTRY_VALUE_NAME}' -Value '${escapedCmd}' -Force
+Write-Output 'ENABLED'
+`
+    : `
+Remove-ItemProperty -Path '${REGISTRY_RUN_KEY}' -Name '${REGISTRY_VALUE_NAME}' -ErrorAction SilentlyContinue
+Write-Output 'DISABLED'
+`;
+  const res = await runPowerShell(ps);
+  return {
+    ok: res.ok,
+    enabled: Boolean(enabled) && res.ok,
+    command: commandStr,
+    scriptPath: START_BG_VBS,
+    reason: res.ok ? undefined : res.stderr || 'Không thể cập nhật Registry Windows.',
+  };
 }
 
 async function setWindowsWallpaper(imagePath) {
@@ -84,7 +866,7 @@ async function backupCurrentWallpaperIfNeeded() {
     backupCopyPath: backupCopyPath || currentPath || '',
     backedUpAt: Date.now(),
   };
-  fs.writeFileSync(WALLPAPER_BACKUP_META, JSON.stringify(meta, null, 2), 'utf-8');
+  writeJsonAtomic(WALLPAPER_BACKUP_META, meta);
   return meta;
 }
 
@@ -158,53 +940,178 @@ foreach ($p in $procs) {
   await runPowerShell(psScript);
 }
 
-const DEFAULT_DISTRACTING_PROCESSES = [
-  'steam',
-  'epicgameslauncher',
-  'riotclientservices',
-  'leagueclient',
-  'valorant',
-  'discord',
-  'spotify',
-  'vlc',
-  'netflix',
-  'tiktok',
-];
+async function tryFocusExistingAppWindow() {
+  const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinFocus {
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+"@
+$procs = Get-Process | Where-Object { $_.MainWindowTitle -like "*LÊN NÚI*" -or $_.MainWindowTitle -like "*ASCEND THE MOUNTAIN*" }
+foreach ($p in $procs) {
+  if ($p.MainWindowHandle -ne 0) {
+    [WinFocus]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+    [WinFocus]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+    Write-Output "FOCUSED"
+    exit 0
+  }
+}
+Write-Output "NONE"
+`;
+  const res = await runPowerShell(psScript);
+  return res.ok && res.stdout.includes('FOCUSED');
+}
 
-async function enforceProcessWhitelist() {
-  if (!isMonkModeLocked || !processGuardEnabled) return;
-  const ps = `Get-Process | Where-Object { $_.MainWindowTitle -ne "" } | Select-Object Id, ProcessName, MainWindowTitle | ConvertTo-Json -Compress`;
-  const out = await runPowerShell(ps);
-  if (!out.ok || !out.stdout) return;
-  let apps = [];
-  try {
-    const parsed = JSON.parse(out.stdout);
-    apps = Array.isArray(parsed) ? parsed : [parsed];
-  } catch {
+function findNativeAppHostExecutable() {
+  const candidates = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Microsoft\\Edge\\Application\\msedge.exe'),
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+async function cleanupOrphanedAppProfileProcesses() {
+  if (SKIP_OS_SIDE_EFFECTS || process.platform !== 'win32') return false;
+  const profileLeaf = path.basename(PROFILE_DIR).replace(/'/g, "''");
+  const psScript = `
+$cutoff = (Get-Date).AddSeconds(-4)
+$targets = Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object {
+  $_.CommandLine -like "*${profileLeaf}*" -and $_.CommandLine -notlike "*--type=*" -and $_.CreationDate -lt $cutoff
+}
+if ($targets) {
+  $killed = $false
+  foreach ($t in $targets) {
+    $gp = Get-Process -Id $t.ProcessId -ErrorAction SilentlyContinue
+    if ($gp -and $gp.MainWindowHandle -eq 0) {
+      Stop-Process -Id $t.ProcessId -Force -ErrorAction SilentlyContinue
+      $killed = $true
+    }
+  }
+  if ($killed) { Write-Output "KILLED_ORPHAN" }
+}
+`;
+  const res = await runPowerShell(psScript);
+  return Boolean(res.ok && res.stdout.includes('KILLED_ORPHAN'));
+}
+
+async function focusOrLaunchDesktopWindow(url = `http://127.0.0.1:${actualPort}`) {
+  if (NO_WINDOW) return;
+  ensureDataDir();
+
+  const focused = await tryFocusExistingAppWindow();
+  if (focused) {
+    logDaemon('Focused existing desktop window');
     return;
   }
 
-  const allowedSet = new Set([
-    'chrome',
-    'msedge',
-    'explorer',
-    'powershell',
-    'pwsh',
-    'cmd',
-    'code',
-    ...activeWhitelist.map((s) => String(s).toLowerCase().replace(/\.exe$/i, '')),
-  ]);
+  // If a headless/windowless instance is holding desktop-window-profile lockfile without any window, clear it first
+  const cleanedOrphan = await cleanupOrphanedAppProfileProcesses();
+  if (cleanedOrphan) {
+    await new Promise((r) => setTimeout(r, 400));
+  }
 
-  for (const proc of apps) {
-    const pName = String(proc.ProcessName || '').toLowerCase();
-    if (!pName || allowedSet.has(pName)) continue;
-    if (DEFAULT_DISTRACTING_PROCESSES.includes(pName)) {
-      await runPowerShell(`Stop-Process -Id ${Number(proc.Id)} -Force -ErrorAction SilentlyContinue`);
+  const hostExe = findNativeAppHostExecutable();
+  if (hostExe) {
+    console.log(`[LÊN NÚI DESKTOP] Đang mở cửa sổ Desktop App tại: ${url}`);
+    logDaemon(`Launching desktop window via ${path.basename(hostExe)} (${url})`);
+
+    if (process.platform === 'win32') {
+      const escPs = (v) => `'${String(v).replace(/'/g, "''")}'`;
+      const argLine = [
+        `--app=${url}`,
+        `"--user-data-dir=${PROFILE_DIR}"`,
+        '--window-size=1440,920',
+        '--no-first-run',
+        '--no-default-browser-check',
+      ].join(' ');
+      const psLaunch = `Start-Process -FilePath ${escPs(hostExe)} -ArgumentList ${escPs(argLine)} -WorkingDirectory ${escPs(ROOT)} -WindowStyle Normal`;
+      const launched = await runPowerShell(psLaunch);
+      if (launched.ok) return;
+      logDaemon(`Start-Process launch failed (${launched.stderr || 'unknown'}), falling back to spawn`);
     }
+
+    const child = spawn(
+      hostExe,
+      [
+        `--app=${url}`,
+        `--user-data-dir=${PROFILE_DIR}`,
+        '--window-size=1440,920',
+        '--no-first-run',
+        '--no-default-browser-check',
+      ],
+      {
+        cwd: ROOT,
+        detached: true,
+        stdio: 'ignore',
+      }
+    );
+    child.unref();
+    return;
+  }
+
+  logDaemon(`Launching URL via default browser (${url})`);
+  await runPowerShell(`Start-Process "${url}"`);
+}
+
+function startTrayHelper(port) {
+  if (NO_TRAY || SKIP_OS_SIDE_EFFECTS || process.platform !== 'win32') return;
+  if (!fs.existsSync(TRAY_PS1_PATH)) return;
+  if (trayChild && !trayChild.killed) return;
+
+  try {
+    trayChild = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-WindowStyle',
+        'Hidden',
+        '-File',
+        TRAY_PS1_PATH,
+        '-ServerUrl',
+        `http://127.0.0.1:${port}`,
+        '-DataDir',
+        DATA_DIR,
+        '-ParentPid',
+        String(process.pid),
+      ],
+      {
+        cwd: ROOT,
+        detached: true,
+        windowsHide: true,
+        stdio: 'ignore',
+      }
+    );
+    trayChild.unref();
+  } catch (err) {
+    console.warn('[LÊN NÚI DAEMON] Không thể khởi tạo Tray Icon:', err);
   }
 }
 
-setInterval(enforceProcessWhitelist, 5000);
+function stopTrayHelper() {
+  if (trayChild && !trayChild.killed) {
+    try {
+      trayChild.kill();
+    } catch {
+      // Ignore
+    }
+    trayChild = null;
+  }
+}
 
 function readJsonBody(req) {
   return new Promise((resolve) => {
@@ -222,6 +1129,49 @@ function readJsonBody(req) {
   });
 }
 
+function checkExistingDaemon(port) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/api/daemon/status`, { timeout: 1200 }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          resolve(Boolean(res.statusCode === 200 && parsed?.ok));
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+function sendPostToDaemon(port, endpoint) {
+  return new Promise((resolve) => {
+    const req = http.request(
+      `http://127.0.0.1:${port}${endpoint}`,
+      { method: 'POST', timeout: 2000, headers: { 'Content-Length': '0' } },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      }
+    );
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
@@ -234,37 +1184,213 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
-  const urlObj = new URL(req.url || '/', `http://127.0.0.1:${PREFERRED_PORT}`);
+  const urlObj = new URL(req.url || '/', `http://127.0.0.1:${actualPort}`);
   const pathname = urlObj.pathname;
 
   if (pathname.startsWith('/api/')) {
+    const reqOrigin = req.headers.origin;
+    if (reqOrigin && !isAllowedLocalOrigin(reqOrigin)) {
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: 'Forbidden cross-origin request to local daemon API.',
+        })
+      );
+      return;
+    }
+    if (reqOrigin && isAllowedLocalOrigin(reqOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
     if (pathname === '/api/db' && req.method === 'GET') {
-      ensureDataDir();
-      if (!fs.existsSync(DB_PATH)) {
-        res.end(JSON.stringify({ data: null }));
-        return;
-      }
-      try {
-        const raw = fs.readFileSync(DB_PATH, 'utf-8');
-        const parsed = JSON.parse(raw);
-        isMonkModeLocked = Boolean(parsed?.session?.isMonkModeOn);
-        res.end(JSON.stringify({ data: parsed }));
-      } catch {
-        res.end(JSON.stringify({ data: null }));
-      }
+      const result = runBackgroundEvaluation('api-db-get');
+      res.end(JSON.stringify({ data: result.db || null }));
       return;
     }
 
     if (pathname === '/api/db' && req.method === 'POST') {
       ensureDataDir();
       const body = await readJsonBody(req);
-      if (body?.data) {
-        isMonkModeLocked = Boolean(body.data?.session?.isMonkModeOn);
-        fs.writeFileSync(DB_PATH, JSON.stringify(body.data, null, 2), 'utf-8');
+      if (body?.data && body.data.session) {
+        const now = Date.now();
+        const extracted = extractEmbeddedProofsFromDb(body.data);
+        const incoming = extracted.db;
+        const existingDb = readJsonSafe(DB_PATH);
+        const allowEmptyOverwrite = body?.allowEmptyOverwrite === true;
+
+        if (
+          existingDb &&
+          !isEssentiallyEmptyDb(existingDb) &&
+          isEssentiallyEmptyDb(incoming) &&
+          !allowEmptyOverwrite
+        ) {
+          logDaemon(
+            `Blocked accidental empty DB overwrite (existingScore=${getDbRichnessScore(existingDb)})`
+          );
+          res.end(
+            JSON.stringify({
+              ok: false,
+              skippedOverwrite: true,
+              path: DB_PATH,
+            })
+          );
+          return;
+        }
+
+        if (
+          existingDb &&
+          !isEssentiallyEmptyDb(existingDb) &&
+          (!fs.existsSync(DB_BACKUP_PATH) ||
+            now - lastDbBackupAt > 300000 ||
+            getDbRichnessScore(existingDb) > getDbRichnessScore(incoming))
+        ) {
+          writeJsonAtomic(DB_BACKUP_PATH, existingDb);
+          writeRotatingBackup(existingDb);
+          lastDbBackupAt = now;
+        }
+
+        incoming.session.lastActiveAt = Math.max(incoming.session.lastActiveAt || 0, now);
+        incoming.session.maxObservedAt = Math.max(
+          incoming.session.maxObservedAt || 0,
+          incoming.session.lastActiveAt,
+          now
+        );
+        isMonkModeLocked = Boolean(incoming.session.isMonkModeOn);
+        writeJsonAtomic(DB_PATH, incoming);
+        dbUpdatedAt = now;
+        recordHeartbeat(now, incoming.session.maxObservedAt);
+        const pendingInfo = getCurrentPendingObligations(incoming, now);
+        updateTrayStatus(incoming, pendingInfo);
       }
       res.end(JSON.stringify({ ok: true, path: DB_PATH }));
+      return;
+    }
+
+    if (pathname === '/api/proofs/upload' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const dataUrl = body?.dataUrl;
+      if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: 'Dữ liệu ảnh không hợp lệ.' }));
+        return;
+      }
+      const filename = saveProofDataUrlToFile(dataUrl, body?.prefix || 'pow');
+      res.end(JSON.stringify({ ok: true, filename, url: `/api/proofs/${filename}` }));
+      return;
+    }
+
+    if (pathname.startsWith('/api/proofs/') && req.method === 'GET') {
+      const rawName = decodeURIComponent(pathname.slice('/api/proofs/'.length));
+      const safeName = path.basename(rawName);
+      if (!safeName || safeName !== rawName || safeName.includes('..')) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: 'Tên tệp không hợp lệ.' }));
+        return;
+      }
+      const imgPath = path.join(PROOFS_DIR, safeName);
+      if (!fs.existsSync(imgPath) || !fs.statSync(imgPath).isFile()) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: 'Không tìm thấy ảnh bằng chứng.' }));
+        return;
+      }
+      const ext = path.extname(safeName).toLowerCase();
+      const contentType =
+        ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      fs.createReadStream(imgPath).pipe(res);
+      return;
+    }
+
+    if (pathname === '/api/daemon/status' && req.method === 'GET') {
+      const db = readJsonSafe(DB_PATH);
+      const now = Date.now();
+      const pendingInfo = db?.session ? getCurrentPendingObligations(db, now) : null;
+      res.end(
+        JSON.stringify({
+          ok: true,
+          pid: process.pid,
+          port: actualPort,
+          startedAt,
+          uptimeSec: Math.floor((now - startedAt) / 1000),
+          trayRunning: Boolean(trayChild && !trayChild.killed && trayChild.exitCode === null),
+          lastHeartbeatAt: lastHeartbeatAt || startedAt,
+          lastEvaluationAt: lastEvaluationAt || startedAt,
+          dbUpdatedAt,
+          pendingCutoffMs: pendingInfo?.cutoffMs,
+          pendingMinutesLeft: pendingInfo?.minutesLeft,
+          pendingViolationsCount: pendingInfo?.findings?.length ?? 0,
+        })
+      );
+      return;
+    }
+
+    if (pathname === '/api/daemon/heartbeat' && req.method === 'POST') {
+      const result = runBackgroundEvaluation('ui-heartbeat');
+      res.end(
+        JSON.stringify({
+          ok: true,
+          evaluated: result.evaluated,
+          lastActiveAt: lastHeartbeatAt,
+          dbUpdatedAt,
+        })
+      );
+      return;
+    }
+
+    if (pathname === '/api/daemon/open-window' && req.method === 'POST') {
+      await focusOrLaunchDesktopWindow(`http://127.0.0.1:${actualPort}`);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (pathname === '/api/daemon/quit' && req.method === 'POST') {
+      res.end(JSON.stringify({ ok: true }));
+      flushShutdownTimestamps();
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      stopTrayHelper();
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 500);
+      return;
+    }
+
+    if (pathname === '/api/os/autostart' && req.method === 'GET') {
+      const status = await getWindowsAutoStartStatus();
+      res.end(JSON.stringify(status));
+      return;
+    }
+
+    if (pathname === '/api/os/autostart' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const enabled = Boolean(body?.enabled);
+      const result = await setWindowsAutoStart(enabled);
+      const db = readJsonSafe(DB_PATH);
+      if (db && db.session) {
+        db.session.autoStartWithWindows = enabled;
+        writeJsonAtomic(DB_PATH, db);
+        dbUpdatedAt = Date.now();
+      }
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (pathname === '/api/os/notify' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (body?.title || body?.body) {
+        pushTrayNotification(body.title || 'Lên Núi', body.body || '', body.level || 'info');
+      }
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -334,6 +1460,36 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/api/proofs/cleanup' && req.method === 'POST') {
+      const currentDb = readJsonSafe(DB_PATH);
+      const result = cleanupOrphanProofsOnDisk(currentDb);
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (pathname === '/api/backup/portable' && req.method === 'GET') {
+      const includeKeys = urlObj.searchParams.get('includeApiKeys') === '1';
+      const currentDb = readJsonSafe(DB_PATH);
+      if (!currentDb || !currentDb.session) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ ok: false, error: 'Chưa có cơ sở dữ liệu trên đĩa.' }));
+        return;
+      }
+      const bundle = buildPortableBackupBundle(currentDb, includeKeys);
+      res.end(JSON.stringify(bundle));
+      return;
+    }
+
+    if (pathname === '/api/backup/restore-portable' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const result = restorePortableBackupBundle(body);
+      if (!result.ok) {
+        res.statusCode = 400;
+      }
+      res.end(JSON.stringify(result));
+      return;
+    }
+
     res.statusCode = 404;
     res.end(JSON.stringify({ error: 'Not found' }));
     return;
@@ -354,71 +1510,90 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function findNativeAppHostExecutable() {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
-    path.join(process.env.LOCALAPPDATA || '', 'Microsoft\\Edge\\Application\\msedge.exe'),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
-  }
-  return null;
-}
+function onDaemonListening(port) {
+  actualPort = port;
+  const url = `http://127.0.0.1:${port}`;
+  console.log(`[LÊN NÚI DAEMON] Đang chạy nền tại ${url} (PID ${process.pid})`);
+  logDaemon(`Daemon listening at ${url} (PID ${process.pid}, background=${IS_BACKGROUND})`);
 
-function launchDesktopWindow(url) {
-  if (process.env.NO_WINDOW === 'true') return;
-  ensureDataDir();
+  // Chạy kiểm tra xét duyệt bù NGAY KHI BẬT MÁY / KHỞI ĐỘNG
+  runBackgroundEvaluation('startup');
 
-  const freshUrl = `${url}/?t=${Date.now()}`;
-  const hostExe = findNativeAppHostExecutable();
-  if (hostExe) {
-    console.log(`[LÊN NÚI DESKTOP] Đang mở cửa sổ Desktop App tại: ${freshUrl}`);
-    const child = spawn(
-      hostExe,
-      [
-        `--app=${freshUrl}`,
-        `--user-data-dir=${PROFILE_DIR}`,
-        '--window-size=1440,920',
-        '--no-first-run',
-        '--no-default-browser-check',
-      ],
-      {
-        cwd: ROOT,
-        detached: true,
-        stdio: 'ignore',
-      }
-    );
-    child.unref();
-    return;
+  // Đồng bộ tự khởi động cùng Windows theo cấu hình DB (chỉ khi chạy thực tế)
+  if (!SKIP_OS_SIDE_EFFECTS) {
+    const db = readJsonSafe(DB_PATH);
+    const shouldAutoStart = db?.session ? db.session.autoStartWithWindows !== false : true;
+    setWindowsAutoStart(shouldAutoStart).catch(() => {});
   }
 
-  runPowerShell(`Start-Process "${freshUrl}"`);
+  startTrayHelper(port);
+
+  watchdogTimer = setInterval(() => {
+    runBackgroundEvaluation('watchdog');
+  }, 30000);
+
+  if (!IS_BACKGROUND && !NO_WINDOW) {
+    focusOrLaunchDesktopWindow(url);
+  }
 }
 
-server.on('error', (err) => {
+server.on('error', async (err) => {
   if (err && err.code === 'EADDRINUSE') {
-    console.log(`[LÊN NÚI DESKTOP] Cổng ${PREFERRED_PORT} đang được sử dụng, chuyển sang cổng tự động...`);
+    const running = await checkExistingDaemon(PREFERRED_PORT);
+    if (running) {
+      if (!IS_BACKGROUND && !NO_WINDOW) {
+        await focusOrLaunchDesktopWindow(`http://127.0.0.1:${PREFERRED_PORT}`);
+      }
+      process.exit(0);
+    }
+    console.log(`[LÊN NÚI DESKTOP] Cổng ${PREFERRED_PORT} đang bận bởi tiến trình khác, chuyển sang cổng tự động...`);
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : PREFERRED_PORT;
-      const url = `http://127.0.0.1:${port}`;
-      console.log(`[LÊN NÚI DESKTOP] Server đang chạy tại ${url}`);
-      launchDesktopWindow(url);
+      onDaemonListening(port);
     });
   } else {
     console.error('[LÊN NÚI DESKTOP] Server error:', err);
   }
 });
 
-server.listen(PREFERRED_PORT, '127.0.0.1', () => {
-  const addr = server.address();
-  const port = typeof addr === 'object' && addr ? addr.port : PREFERRED_PORT;
-  const url = `http://127.0.0.1:${port}`;
-  console.log(`[LÊN NÚI DESKTOP] Server & Windows OS Engine đang chạy tại ${url}`);
-  console.log(`[LÊN NÚI DESKTOP] Giữ cửa sổ này (hoặc thu nhỏ xuống thanh Taskbar) trong lúc sử dụng App.`);
-  launchDesktopWindow(url);
+process.on('SIGINT', () => {
+  flushShutdownTimestamps();
+  stopTrayHelper();
+  process.exit(0);
 });
+process.on('SIGTERM', () => {
+  flushShutdownTimestamps();
+  stopTrayHelper();
+  process.exit(0);
+});
+
+async function main() {
+  ensureDataDir();
+  tryRecoverFromChromiumLevelDb();
+
+  const alreadyUp = await checkExistingDaemon(PREFERRED_PORT);
+  if (alreadyUp) {
+    console.log(`[LÊN NÚI DAEMON] Phát hiện daemon đã chạy nền ở cổng ${PREFERRED_PORT}.`);
+    if (!IS_BACKGROUND && !NO_WINDOW) {
+      await focusOrLaunchDesktopWindow(`http://127.0.0.1:${PREFERRED_PORT}`);
+    }
+    process.exit(0);
+  }
+
+  server.listen(PREFERRED_PORT, '127.0.0.1', () => {
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : PREFERRED_PORT;
+    onDaemonListening(port);
+  });
+}
+
+const IS_MAIN_MODULE =
+  typeof process !== 'undefined' &&
+  Array.isArray(process.argv) &&
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (IS_MAIN_MODULE) {
+  main();
+}

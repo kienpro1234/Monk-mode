@@ -1,271 +1,336 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import {
-  Mountain,
-  Flame,
-  Swords,
-  BookOpen,
-  ScrollText,
-  Shield,
-  Lock,
-  Unlock,
   AlertTriangle,
-  Plus,
-  Check,
-  Clock,
-  Camera,
-  Wallpaper,
-  RotateCcw,
-  Sparkles,
-  Bell,
-  Sliders,
-  Eye,
-  Trash2,
+  ArrowLeft,
   Award,
-  FileText,
-  RefreshCw,
+  Bot,
+  Calendar,
+  Cpu,
   Edit3,
-  LayoutGrid,
-  CheckSquare,
-  Square,
+  FileText,
+  Flame,
+  History,
+  Lightbulb,
+  Moon,
+  Mountain,
+  PieChart,
+  Scale,
+  ScrollText,
+  Search,
+  Settings,
+  ShieldAlert,
+  ShieldCheck,
+  Sparkles,
+  Sun,
+  Swords,
 } from 'lucide-react';
 import {
-  MonkDatabaseSchema,
-  PeakGoalEntity,
-  RitualHabitEntity,
+  ConfirmDeleteTarget,
   DailyStrikeTodoEntity,
-  ReflectionJournalEntity,
-  SacredScrollEntity,
+  DailyWorkShiftRecord,
+  FocusSessionLogEntity,
+  MonkDatabaseSchema,
+  MountainMilestoneItem,
+  OptimizationCategory,
+  OptimizationNoteEntity,
+  PeakGoalEntity,
   ProofAnalysisResult,
-  ViolationRecord,
+  RestDayRecord,
+  SacredScrollEntity,
+  SavedScheduleProfile,
+  SIDE_QUEST_GOAL_ID,
+  StrikeProofPhotoItem,
+  TaskModificationLog,
+  TimeAuditConfig,
+  TodoActivityType,
+  WorkShiftMode,
 } from './types/models';
-import { desktopBridge, RunningOSApp } from './services/desktopBridge';
+import {
+  AutoStartStatusInfo,
+  DaemonStatusInfo,
+  desktopBridge,
+} from './services/desktopBridge';
 import { createInitialDatabase, getTodayDateStr } from './services/defaultData';
-import { soundEngine } from './utils/soundEngine';
-import { analyzeReflectionText, renderMonkDesktopWallpaper } from './utils/proofOfWork';
+import { AmbientSoundMode, soundEngine } from './utils/soundEngine';
 import { ShanshuiCanvasBg } from './components/ShanshuiCanvasBg';
-import { WoodblockSealSvg } from './components/WoodblockSealSvg';
-import { PomodoroLockModal } from './components/PomodoroLockModal';
-import { LiveProofModal } from './components/LiveProofModal';
-import { RelentlessAlarmOverlay, ActiveNaggingAlert } from './components/RelentlessAlarmOverlay';
-import { SacredScrollBookViewer } from './components/SacredScrollBookViewer';
+import { QuickCommandPalette } from './components/QuickCommandPalette';
+import {
+  LawEvaluationResult,
+  evaluateDayImmediately,
+  evaluatePendingDays,
+  findDayViolations,
+  getEffectiveDayStartTime,
+  getEffectiveNightStartTime,
+  getLawConfig,
+  getShiftDateStr,
+  getShiftEndOfDayMs,
+  isRitualScheduledForDate,
+  parseShiftStartHM,
+  shiftDateStr,
+} from './services/mountainLaws';
+import {
+  getDayOfWeekFromDateStr,
+  syncPlanPreWorkLock,
+} from './services/aiSchedulePlanner';
+import {
+  computeDayTimeAudit,
+  inferTodoActivityType,
+  LiveActiveSessionInput,
+} from './services/timeAuditEngine';
+import { GoalsHubView, MountainStats } from './views/GoalsHubView';
+import { AIScheduleView } from './views/AIScheduleView';
+import { TimeAuditView } from './views/TimeAuditView';
+import { OptimizationVaultView } from './views/OptimizationVaultView';
+import { SideQuestsView, SideQuestTemplate } from './views/SideQuestsView';
+import { RitualsView } from './views/RitualsView';
+import { LawsView } from './views/LawsView';
+import { TangKinhCacView } from './views/TangKinhCacView';
+import { SettingsView } from './views/SettingsView';
+import { FocusChamberView } from './views/FocusChamberView';
+import { GoalInnerView, InnerGoalTab } from './views/GoalInnerView';
+import { AppModals } from './views/AppModals';
 
-type ActiveTab =
-  | 'UNIFIED_4_IN_1'
-  | 'PEAK_GOALS'
+type OuterNavTab =
+  | 'GOALS_LIST'
+  | 'AI_SCHEDULE'
+  | 'TIME_AUDIT'
+  | 'OPTIMIZATION_VAULT'
+  | 'SIDE_QUESTS'
   | 'RITUALS'
-  | 'DAILY_STRIKES'
-  | 'REFLECTION'
+  | 'LAWS'
   | 'TANG_KINH_CAC'
-  | 'OS_LOCKDOWN';
+  | 'SETTINGS';
 
-interface ActivePomodoroTarget {
-  type: 'RITUAL' | 'STRIKE';
-  id: string;
-  title: string;
-  requiredMins: number;
-  requiresPhoto: boolean;
+function buildFocusSessionLog(
+  strike: DailyStrikeTodoEntity,
+  durationMins: number,
+  source: FocusSessionLogEntity['source'],
+  dateStr: string,
+  goals: PeakGoalEntity[],
+  endedAtMs: number = Date.now()
+): FocusSessionLogEntity {
+  const mins = Math.max(1, Math.round(durationMins));
+  const goalsMap = new Map(goals.map((g) => [g.id, g]));
+  const actType = inferTodoActivityType(strike, goalsMap);
+  return {
+    id: `flog-${endedAtMs}-${Math.random().toString(36).slice(2, 6)}`,
+    date: dateStr,
+    startedAt: endedAtMs - mins * 60000,
+    endedAt: endedAtMs,
+    durationMins: mins,
+    activityType: actType,
+    goalId: strike.goalId,
+    strikeId: strike.id,
+    title: strike.title,
+    source,
+  };
 }
 
-interface ActiveProofTarget {
-  type: 'RITUAL' | 'STRIKE';
-  id: string;
-  title: string;
-  completedPomodoroMins: number;
-}
+const SIDE_QUEST_TEMPLATES: SideQuestTemplate[] = [
+  { title: '🚿 Tắm rửa', mins: 15 },
+  { title: '👕 Giặt & phơi quần áo', mins: 15 },
+  { title: '🧺 Gấp & cất quần áo', mins: 10 },
+  { title: '🧹 Dọn dẹp phòng', mins: 15 },
+  { title: '🍽️ Rửa bát', mins: 10 },
+  { title: '🍳 Nấu ăn', mins: 25 },
+  { title: '🛏️ Gấp chăn, dọn giường', mins: 5 },
+  { title: '🗑️ Đổ rác', mins: 5 },
+];
 
 export const App: React.FC = () => {
-  // Initialize synchronously so UI renders 100% immediately on first paint
   const [db, setDb] = useState<MonkDatabaseSchema>(() => createInitialDatabase());
-  const [activeTab, setActiveTab] = useState<ActiveTab>('UNIFIED_4_IN_1');
-  const [isLockScreenOverlay, setIsLockScreenOverlay] = useState(false);
 
-  // Dev / Simulation Controls
-  const [devBarVisible, setDevBarVisible] = useState(true);
-  const [simulatedTimeOffsetMs, setSimulatedTimeOffsetMs] = useState(0);
-  const [forceOpenReflectionWindow, setForceOpenReflectionWindow] = useState(false);
+  // Navigation State
+  const [outerTab, setOuterTab] = useState<OuterNavTab>('GOALS_LIST');
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
+  const [innerTab, setInnerTab] = useState<InnerGoalTab>('DAILY_STRIKES');
+  const [focusedStrikeId, setFocusedStrikeId] = useState<string | null>(null);
+
+  // Drift-Free Timestamp-Anchored Pomodoro Timer State
+  const [pomoSecondsLeft, setPomoSecondsLeft] = useState<number>(25 * 60);
+  const [pomoTotalSeconds, setPomoTotalSeconds] = useState<number>(25 * 60);
+  const [pomoRunning, setPomoRunning] = useState<boolean>(false);
+  const pomoStartMinsRef = useRef<number>(25);
+  const pomoEndTimeMsRef = useRef<number | null>(null);
+  const pomoSecondsLeftRef = useRef<number>(25 * 60);
+  const pomoCompletedGuardRef = useRef<boolean>(false);
+
+  // Clock ticker
   const [nowTick, setNowTick] = useState(Date.now());
 
   // Modals & Overlays
-  const [activePomodoro, setActivePomodoro] = useState<ActivePomodoroTarget | null>(null);
-  const [activeProof, setActiveProof] = useState<ActiveProofTarget | null>(null);
-  const [naggingAlert, setNaggingAlert] = useState<ActiveNaggingAlert | null>(null);
+  const [proofModalTarget, setProofModalTarget] = useState<{
+    strikeId: string;
+    title: string;
+    markCompleteAfterProof: boolean;
+  } | null>(null);
   const [viewingScroll, setViewingScroll] = useState<SacredScrollEntity | null>(null);
   const [ceremonyScroll, setCeremonyScroll] = useState<SacredScrollEntity | null>(null);
+  const [conqueringGoalId, setConqueringGoalId] = useState<string | null>(null);
+  const [violationModalOpen, setViolationModalOpen] = useState(false);
+  const [confirmDeleteTarget, setConfirmDeleteTarget] = useState<ConfirmDeleteTarget | null>(null);
+  const [zoomedHistoryPhoto, setZoomedHistoryPhoto] = useState<{
+    uri: string;
+    title: string;
+    caption: string;
+    dateStr: string;
+  } | null>(null);
+
   const [sternToast, setSternToast] = useState<{
     title: string;
     message: string;
     type: 'danger' | 'info' | 'seal';
   } | null>(null);
 
-  // Editing Single Peak Goal & Session Motto
-  const [editingPeakGoal, setEditingPeakGoal] = useState(false);
+  // Create / Edit Mountain (Goal) Modal State
+  const [goalModalOpen, setGoalModalOpen] = useState(false);
+  const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
   const [goalTitleDraft, setGoalTitleDraft] = useState('');
+  const [goalCategoryDraft, setGoalCategoryDraft] = useState('Ngoại Ngữ & Chứng Chỉ');
   const [goalDescDraft, setGoalDescDraft] = useState('');
-  const [goalTargetDraft, setGoalTargetDraft] = useState(100);
-  const [goalUnitDraft, setGoalUnitDraft] = useState('điểm KPI');
-  const [mottoDraft, setMottoDraft] = useState('');
-  const [initialDaysDraft, setInitialDaysDraft] = useState(14);
+  const [goalVowDraft, setGoalVowDraft] = useState('');
+  const [goalHasDeadlineDraft, setGoalHasDeadlineDraft] = useState(false);
+  const [goalTargetDateDraft, setGoalTargetDateDraft] = useState('');
+  const [goalMilestonesDraft, setGoalMilestonesDraft] = useState<MountainMilestoneItem[]>([]);
+  const [newMilestoneText, setNewMilestoneText] = useState('');
 
-  // New Ritual (Habit Tracker) Form
-  const [newRitualTitle, setNewRitualTitle] = useState('');
-  const [newRitualStart, setNewRitualStart] = useState('05:00');
-  const [newRitualEnd, setNewRitualEnd] = useState('06:30');
-  const [newRitualPomo, setNewRitualPomo] = useState(25);
-  const [newRitualPhoto, setNewRitualPhoto] = useState(true);
+  // Drag and Drop reordering state for Ritual Checkboxes
+  const [draggingRitualItem, setDraggingRitualItem] = useState<{
+    groupId: string;
+    itemId: string;
+    itemIndex: number;
+  } | null>(null);
+  const [dragOverTargetIndex, setDragOverTargetIndex] = useState<{
+    groupId: string;
+    itemIndex: number;
+  } | null>(null);
 
-  // New Daily Strike (Todo List) Form
-  const [newStrikeTitle, setNewStrikeTitle] = useState('');
-  const [newStrikeTime, setNewStrikeTime] = useState('14:00');
-  const [newStrikeWeight, setNewStrikeWeight] = useState(25);
-  const [newStrikePomo, setNewStrikePomo] = useState(25);
+  // Side Quests form state
+  const [sideQuestTitle, setSideQuestTitle] = useState('');
+  const [sideQuestPomo, setSideQuestPomo] = useState(15);
+  const [sideQuestActivityType, setSideQuestActivityType] = useState<TodoActivityType>('CHORE');
+  const [sideQuestRequiresPhoto, setSideQuestRequiresPhoto] = useState(false);
+  const [sideQuestShowHistory, setSideQuestShowHistory] = useState(false);
 
-  // Reflection Journal Form
-  const [journalDraft, setJournalDraft] = useState('');
-  const [repentanceDraft, setRepentanceDraft] = useState('');
-  const [focusRatingDraft, setFocusRatingDraft] = useState(5);
-  const [clipboardBlockedMsg, setClipboardBlockedMsg] = useState<string | null>(null);
+  // Break timer, ambient sound & command palette state
+  const [breakSecondsLeft, setBreakSecondsLeft] = useState<number | null>(null);
+  const [breakTotalSeconds, setBreakTotalSeconds] = useState<number>(300);
+  const breakEndTimeMsRef = useRef<number | null>(null);
+  const [ambientMode, setAmbientMode] = useState<AmbientSoundMode>('OFF');
+  const [ambientVolume, setAmbientVolume] = useState<number>(0.35);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
 
-  // OS Lockdown Running Apps
-  const [runningApps, setRunningApps] = useState<RunningOSApp[]>([]);
-  const [newWhitelistName, setNewWhitelistName] = useState('');
-  const [newWhitelistProcess, setNewWhitelistProcess] = useState('');
-  const [wallpaperStatusMsg, setWallpaperStatusMsg] = useState<string | null>(null);
+  // Settings & Daemon state
+  const [confirmResetMode, setConfirmResetMode] = useState<
+    'NONE' | 'KEEP_RITUAL_FRAMES' | 'TOTAL_WIPE'
+  >('NONE');
+  const [globalMottoDraft, setGlobalMottoDraft] = useState(db.session.mottoText);
+  const [daemonStatus, setDaemonStatus] = useState<DaemonStatusInfo | null>(null);
+  const [autoStartStatus, setAutoStartStatus] = useState<AutoStartStatusInfo | null>(null);
+
+  // Task modification quota modals
+  const [strikeBeingEdited, setStrikeBeingEdited] = useState<DailyStrikeTodoEntity | null>(null);
+  const [editStrikeTitle, setEditStrikeTitle] = useState('');
+  const [editStrikePomo, setEditStrikePomo] = useState(25);
+  const [editStrikeActivityType, setEditStrikeActivityType] =
+    useState<TodoActivityType>('DEEP_WORK');
+  const [editStrikeRequiresPhoto, setEditStrikeRequiresPhoto] = useState(true);
+  const [strikeBeingDeleted, setStrikeBeingDeleted] = useState<DailyStrikeTodoEntity | null>(null);
+  const [showQuotaExhaustedModal, setShowQuotaExhaustedModal] = useState(false);
 
   const showSternMessage = useCallback(
-    (title: string, message: string, type: 'danger' | 'info' | 'seal' = 'danger') => {
+    (title: string, message: string, type: 'danger' | 'info' | 'seal' = 'info') => {
       setSternToast({ title, message, type });
     },
     []
   );
 
-  // Hydrate from persistent DB on mount
+  // Auto-dismiss non-critical toasts after 4.5s
+  useEffect(() => {
+    if (!sternToast || sternToast.type === 'danger') return;
+    const t = window.setTimeout(() => setSternToast(null), 4500);
+    return () => window.clearTimeout(t);
+  }, [sternToast]);
+
+  // DB Ref & Law Engine
+  const dbRef = useRef(db);
+  dbRef.current = db;
+  const [dbLoaded, setDbLoaded] = useState(false);
+  const [lawVerdict, setLawVerdict] = useState<LawEvaluationResult | null>(null);
+
+  const announceLawVerdict = useCallback(
+    (res: LawEvaluationResult) => {
+      if (res.newViolations.length > 0) {
+        soundEngine.playViolationGong();
+        setLawVerdict(res);
+      } else if (res.cleanDays.length > 0) {
+        showSternMessage(
+          '✅ HỆ THỐNG LUẬT NÚI ĐÃ XÉT DUYỆT — KHÔNG CÓ VI PHẠM',
+          `Đã xét ${res.cleanDays.length} ngày vừa qua: bạn giữ vững toàn bộ Luật Núi. Chuỗi ngày kỷ luật hiện tại: ${res.db.session.currentStreak} ngày.`,
+          'seal'
+        );
+      }
+    },
+    [showSternMessage]
+  );
+
+  // Load Database on Mount
   useEffect(() => {
     desktopBridge.loadDatabase().then((loaded) => {
       if (loaded && loaded.session) {
-        // Ensure single Peak Goal invariant (mỗi lần chỉ leo 1 Đỉnh Núi duy nhất)
-        const singleGoalList =
-          loaded.peakGoals && loaded.peakGoals.length > 0
-            ? [loaded.peakGoals[0]]
-            : createInitialDatabase().peakGoals;
-        const normalized = {
-          ...loaded,
-          peakGoals: singleGoalList,
-        };
-        setDb(normalized);
-        setMottoDraft(normalized.session.mottoText);
-        setInitialDaysDraft(normalized.session.initialDays);
-        if (singleGoalList[0]) {
-          setGoalTitleDraft(singleGoalList[0].title);
-          setGoalDescDraft(singleGoalList[0].description);
-          setGoalTargetDraft(singleGoalList[0].targetMetric);
-          setGoalUnitDraft(singleGoalList[0].unit);
+        const cfg = getLawConfig(loaded);
+        const shiftDate = getShiftDateStr(
+          Date.now(),
+          cfg.workShiftMode,
+          getEffectiveNightStartTime(cfg)
+        );
+        const res = evaluatePendingDays(loaded, shiftDate, Date.now());
+        setDb(res.db);
+        if (res.changed) desktopBridge.saveDatabase(res.db);
+        setGlobalMottoDraft(loaded.session.mottoText);
+        announceLawVerdict(res);
+      }
+      setDbLoaded(true);
+    });
+    desktopBridge.getDaemonStatus().then(setDaemonStatus);
+    desktopBridge.getAutoStartStatus().then(setAutoStartStatus);
+  }, [announceLawVerdict]);
+
+  // Background Daemon Sync & Heartbeat
+  useEffect(() => {
+    if (!dbLoaded) return;
+    const syncDaemon = async () => {
+      const hbRes = await desktopBridge.pingHeartbeat();
+      const status = await desktopBridge.getDaemonStatus();
+      if (status.ok) setDaemonStatus(status);
+      if (hbRes.evaluated) {
+        const latest = await desktopBridge.fetchServerDatabase();
+        if (latest && latest.session) {
+          setDb(latest);
+          if (latest.session.pendingOfflineReport?.missedDeadlineWhileOffline) {
+            soundEngine.playViolationGong();
+          }
         }
       }
-    });
-  }, []);
+    };
+    const interval = window.setInterval(syncDaemon, 20000);
+    const onFocus = () => {
+      syncDaemon();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [dbLoaded]);
 
-  // Clock ticker (1s)
+  // 15s Clock Ticker (prevents idle 1s full-app re-renders while Pomodoro uses its own dedicated loop)
   useEffect(() => {
     const id = window.setInterval(() => {
       setNowTick(Date.now());
-    }, 1000);
+    }, 15000);
     return () => clearInterval(id);
   }, []);
-
-  // Keyboard shortcut Ctrl+Shift+Alt+M (Developer Emergency Unlock) & BeforeUnload Guard
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.altKey && e.key.toLowerCase() === 'm') {
-        e.preventDefault();
-        setDb((prev) => {
-          const next = { ...prev, session: { ...prev.session, isMonkModeOn: false } };
-          desktopBridge.saveDatabase(next);
-          return next;
-        });
-        setNaggingAlert(null);
-        desktopBridge.restoreWindowsWallpaper();
-        showSternMessage(
-          'KHẨN CẤP MỞ KHÓA DEVELOPER (Ctrl+Shift+Alt+M)',
-          'Đã cưỡng bức mở khóa Monk Mode và khôi phục hình nền Windows gốc.',
-          'info'
-        );
-      }
-    };
-
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (db?.session.isMonkModeOn) {
-        e.preventDefault();
-        e.returnValue =
-          'GIỚI LUẬT ĐANG KHÓA: Không được phép thoát ứng dụng khi đang ở trên đỉnh núi!';
-        return e.returnValue;
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-    };
-  }, [db?.session.isMonkModeOn, showSternMessage]);
-
-  // Listen to Electron OS events
-  useEffect(() => {
-    if (!window.monkDesktopAPI) return;
-    const unsubClose = window.monkDesktopAPI.onCloseBlocked((data) => {
-      soundEngine.playViolationGong();
-      showSternMessage('CHẶN ĐÓNG ỨNG DỤNG (ZERO-ESCAPE POLICY)', data.message, 'danger');
-    });
-    const unsubProc = window.monkDesktopAPI.onProcessBlocked((data) => {
-      soundEngine.playWoodenFish(0.9);
-      showSternMessage(
-        'ĐÃ ĐÓNG BĂNG ỨNG DỤNG NGOÀI WHITELIST',
-        `Hệ thống vừa chặn tiến trình giải trí/ngoài danh sách trắng: ${data.processName} (${data.title})`,
-        'danger'
-      );
-    });
-    const unsubDev = window.monkDesktopAPI.onDevEmergencyUnlock(() => {
-      setDb((prev) => {
-        const next = {
-          ...prev,
-          session: { ...prev.session, isMonkModeOn: false },
-        };
-        desktopBridge.saveDatabase(next);
-        return next;
-      });
-      setNaggingAlert(null);
-      showSternMessage(
-        'DEV EMERGENCY OVERRIDE (Ctrl+Shift+Alt+M)',
-        'Đã cưỡng bức mở khóa Monk Mode và khôi phục hình nền Windows gốc cho Developer.',
-        'info'
-      );
-    });
-    return () => {
-      unsubClose();
-      unsubProc();
-      unsubDev();
-    };
-  }, [showSternMessage]);
-
-  const effectiveNow = nowTick + simulatedTimeOffsetMs;
-  const todayStr = getTodayDateStr(effectiveNow);
-  const currentHour = new Date(effectiveNow).getHours();
-
-  // Theo Mục 3.3 (Ảnh 2):
-  // - Khi Monk Mode: OFF -> Viết tự do, không giới hạn độ dài tối thiểu (mở mọi lúc!)
-  // - Khi Monk Mode: ON  -> Chỉ mở từ 20:00 đến 23:59 (hoặc khi bật giả lập giờ 21:00)
-  const isReflectionWindowOpen =
-    !db.session.isMonkModeOn ||
-    forceOpenReflectionWindow ||
-    (currentHour >= 20 && currentHour <= 23);
-
-  useEffect(() => {
-    desktopBridge.syncMonkLockState({
-      isMonkModeOn: db.session.isMonkModeOn,
-      whitelistedApps: db.session.whitelistedApps.map((w) => w.processName),
-      processGuardEnabled: db.session.processGuardEnabled,
-    });
-  }, [db]);
 
   const persistDb = useCallback((updater: (prev: MonkDatabaseSchema) => MonkDatabaseSchema) => {
     setDb((prev) => {
@@ -275,632 +340,2062 @@ export const App: React.FC = () => {
     });
   }, []);
 
-  // Single Active Peak Goal (Mỗi lần chỉ leo 1 Đỉnh Núi duy nhất)
-  const currentPeakGoal: PeakGoalEntity = useMemo(() => {
-    return (
-      db.peakGoals[0] || {
-        id: 'goal-single-peak',
-        sessionId: db.session.id,
-        title: 'Chinh phục Đỉnh Núi Kỳ Tu Luyện',
-        description: 'Mục tiêu lớn duy nhất của kỳ tu luyện.',
-        unit: 'điểm KPI',
-        targetMetric: 100,
-        currentMetric: 0,
-        progressPct: 0,
-        isCompleted: false,
-        createdAt: Date.now(),
-      }
-    );
-  }, [db.peakGoals, db.session.id]);
-
-  const overallProgressPct = Math.min(100, Math.max(0, Math.round(currentPeakGoal.progressPct)));
-  const allGoals100Pct = overallProgressPct >= 100;
-  const isTimeCommitmentReached = effectiveNow >= db.session.currentTargetEndTime;
-  const isDualLockSatisfied = isTimeCommitmentReached && allGoals100Pct;
-  const isOvertimeLockActive =
-    Boolean(db.session.isMonkModeOn) && isTimeCommitmentReached && !allGoals100Pct;
-
-  const countdownInfo = useMemo(() => {
-    const diff = db.session.currentTargetEndTime - effectiveNow;
-    if (diff <= 0) {
-      return {
-        text: 'ĐÃ ĐẾN HẠN XUỐNG NÚI (00 Ngày 00:00:00)',
-        isExpired: true,
-      };
-    }
-    const days = Math.floor(diff / 86400000);
-    const hours = Math.floor((diff % 86400000) / 3600000);
-    const mins = Math.floor((diff % 3600000) / 60000);
-    const secs = Math.floor((diff % 60000) / 1000);
-    return {
-      text: `${String(days).padStart(2, '0')} Ngày ${String(hours).padStart(2, '0')}:${String(
-        mins
-      ).padStart(2, '0')}:${String(secs).padStart(2, '0')}`,
-      isExpired: false,
-    };
-  }, [db.session.currentTargetEndTime, effectiveNow]);
-
-  // Execute Mountain Law Violation Penalty (Section 3.2)
-  const triggerMountainLawViolation = useCallback(
-    (type: ViolationRecord['type'], detailReason: string) => {
-      soundEngine.playViolationGong();
-
-      const newTargetEndTime = effectiveNow + db.session.initialDays * 86400000;
-      const violation: ViolationRecord = {
-        id: `vio-${Date.now()}`,
-        sessionId: db.session.id,
-        timestamp: effectiveNow,
-        date: todayStr,
-        type,
-        reason: detailReason,
-        previousStreak: db.session.currentStreak,
-        newTargetEndTime,
-      };
-
-      persistDb((prev) => ({
-        ...prev,
-        session: {
-          ...prev.session,
-          currentStreak: 0,
-          violationCount: prev.session.violationCount + 1,
-          currentTargetEndTime: newTargetEndTime,
-        },
-        violations: [violation, ...prev.violations],
-      }));
-
-      showSternMessage(
-        'VI PHẠM LUẬT NÚI — CHẾ TÀI TỰ ĐỘNG THỰC THI',
-        `“Giới luật đã phá. Chuỗi ngày tu luyện trở về con số không. Núi cao vẫn ở đó, thời gian xuống núi đã lùi lại.” (${detailReason} — Ngày xuống núi mới được cộng bù ${db.session.initialDays} ngày kể từ hôm nay).`,
-        'danger'
-      );
+  // Drag & Drop handlers for Ritual Items
+  const handleDragStartRitualItem = useCallback(
+    (groupId: string, itemId: string, itemIndex: number, e: React.DragEvent) => {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', itemId);
+      setDraggingRitualItem({ groupId, itemId, itemIndex });
     },
-    [db.session, effectiveNow, todayStr, persistDb, showSternMessage]
+    []
   );
 
-  const applyLiveWallpaperToOS = useCallback(
-    async (mode: 'HOME_TEMPLE' | 'LOCK_MOUNTAIN' = 'HOME_TEMPLE') => {
-      setWallpaperStatusMsg(
-        'Đang kết xuất tranh thủy mặc kèm Tâm Niệm & Tiến Độ lên màn hình Windows...'
-      );
-      const dataUrl = await renderMonkDesktopWallpaper({
-        mottoText: db.session.mottoText,
-        remainingDaysText: countdownInfo.text,
-        progressPct: overallProgressPct,
-        currentStreak: db.session.currentStreak,
-        mode,
+  const handleDragOverRitualItem = useCallback(
+    (groupId: string, itemIndex: number, e: React.DragEvent) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      setDragOverTargetIndex((prev) => {
+        if (prev?.groupId === groupId && prev?.itemIndex === itemIndex) return prev;
+        return { groupId, itemIndex };
       });
-      const res = await desktopBridge.setWindowsWallpaper(dataUrl);
-      if (res.ok) {
-        setWallpaperStatusMsg(
-          `Đã cập nhật Hình nền Windows thành công (${
-            mode === 'HOME_TEMPLE' ? 'Nhà sư & Ngôi chùa cổ' : 'Cảnh núi non trùng điệp'
-          }). Bản gốc đã được sao lưu an toàn.`
-        );
-      } else {
-        setWallpaperStatusMsg('Đã kết xuất tranh thủy mặc trong ứng dụng.');
-      }
     },
-    [db.session, countdownInfo.text, overallProgressPct]
+    []
   );
 
-  // Toggle Monk Mode ON / OFF
-  const handleToggleMonkMode = async () => {
-    if (!db.session.isMonkModeOn) {
-      soundEngine.playTempleBell(1.0);
-      const now = effectiveNow;
-      const targetEnd = now + db.session.initialDays * 86400000;
-
+  const handleDropRitualItem = useCallback(
+    (groupId: string, targetIndex: number, e: React.DragEvent) => {
+      e.preventDefault();
+      if (!draggingRitualItem || draggingRitualItem.groupId !== groupId) {
+        setDraggingRitualItem(null);
+        setDragOverTargetIndex(null);
+        return;
+      }
+      const fromIndex = draggingRitualItem.itemIndex;
+      if (fromIndex === targetIndex) {
+        setDraggingRitualItem(null);
+        setDragOverTargetIndex(null);
+        return;
+      }
       persistDb((prev) => ({
         ...prev,
-        session: {
-          ...prev.session,
-          isMonkModeOn: true,
-          startTime: now,
-          currentTargetEndTime: targetEnd,
-        },
-      }));
-      setEditingPeakGoal(false);
-
-      showSternMessage(
-        'ĐÃ NHẬP THẤT LÊN NÚI (MONK MODE: ON — BẮT BUỘC PROOF OF WORK)',
-        'Cửa hồng trần đã khép. Từ lúc này: (1) Nút OFF bị Khóa Kép, (2) Thực hiện Habit/Todo bắt buộc Khóa Pomodoro chống thoát 30s + Chụp ảnh trực tiếp qua Camera/Screen, (3) Tự Vấn bắt buộc >= 100 từ hợp lệ & chặn Copy/Paste!',
-        'seal'
-      );
-
-      if (db.session.autoWallpaperEnabled) {
-        setTimeout(() => {
-          applyLiveWallpaperToOS('HOME_TEMPLE');
-        }, 300);
-      }
-    } else {
-      if (!isTimeCommitmentReached && !allGoals100Pct) {
-        soundEngine.playViolationGong();
-        showSternMessage(
-          'KHÓA KÉP (DUAL-LOCK) TỪ CHỐI MỞ KHÓA',
-          `Không có cửa thoát hiểm (Zero-Escape Policy). Bạn còn ${countdownInfo.text} và tiến độ Đỉnh Núi mới đạt ${overallProgressPct}% (Yêu cầu: Đủ thời gian VÀ đạt 100% Mục tiêu Đỉnh Núi).`,
-          'danger'
-        );
-        return;
-      }
-
-      if (isTimeCommitmentReached && !allGoals100Pct) {
-        soundEngine.playViolationGong();
-        showSternMessage(
-          'CHẾ ĐỘ CƯỠNG BỨC QUÁ GIỜ (OVERTIME LOCK — MỤC 3.1)',
-          `Thời gian dự kiến xuống núi đã kết thúc nhưng tiến độ Đỉnh Núi mới đạt ${overallProgressPct}%. Hệ thống từ chối cho phép tắt Monk Mode! Bạn bắt buộc phải ở lại trên núi cho đến khi hoàn thành nốt ${
-            100 - overallProgressPct
-          }% công việc còn lại.`,
-          'danger'
-        );
-        return;
-      }
-
-      if (!isTimeCommitmentReached && allGoals100Pct) {
-        soundEngine.playViolationGong();
-        showSternMessage(
-          'CHƯA ĐỦ THỜI GIAN CAM KẾT TRÊN NÚI',
-          `Dù tiến độ Đỉnh Núi đã đạt 100%, bạn vẫn phải giữ trọn giới luật thời gian đã cam kết trên núi (${countdownInfo.text} còn lại).`,
-          'danger'
-        );
-        return;
-      }
-
-      // BOTH CONDITIONS SATISFIED -> Launch Sacred Scroll Compilation Ceremony!
-      soundEngine.playWoodblockStampSound();
-      const totalPomodoroMins =
-        db.dailyStrikes.reduce((acc, s) => acc + (s.completedPomodoroMins || 0), 0) +
-        db.ritualHabits.reduce((acc, r) => {
-          const daysCount = Object.values(r.completionsByDate).reduce(
-            (sum, c) => sum + (c.completedPomodoroMins || 0),
-            0
-          );
-          return acc + daysCount;
-        }, 0);
-
-      const totalHours = Number(Math.max(12.5, totalPomodoroMins / 60).toFixed(1));
-      const daysSpent = Math.max(
-        db.session.initialDays,
-        Math.ceil((effectiveNow - db.session.startTime) / 86400000)
-      );
-
-      const snapshotObj = {
-        session: db.session,
-        goals: [currentPeakGoal],
-        rituals: db.ritualHabits,
-        strikes: db.dailyStrikes,
-        journals: db.reflectionJournals,
-        violations: db.violations,
-      };
-
-      const newScroll: SacredScrollEntity = {
-        id: `scroll-${Date.now()}`,
-        sessionId: db.session.id,
-        title: `Bí Kíp Đắc Đạo: ${currentPeakGoal.title.slice(0, 48)}`,
-        mottoText: db.session.mottoText,
-        sealedAt: effectiveNow,
-        totalDaysSpent: daysSpent,
-        initialDaysCommitted: db.session.initialDays,
-        totalPomodoroHours: totalHours,
-        violationCount: db.session.violationCount,
-        sealHash: `CHU-SA-9E2A2B-${Math.random().toString(16).substring(2, 10).toUpperCase()}`,
-        snapshotJson: JSON.stringify(snapshotObj),
-        exportedPdfUri: null,
-      };
-
-      setCeremonyScroll(newScroll);
-    }
-  };
-
-  const handleFinishDescendCeremony = async () => {
-    if (!ceremonyScroll) return;
-    persistDb((prev) => ({
-      ...prev,
-      session: {
-        ...prev.session,
-        isMonkModeOn: false,
-      },
-      sacredScrolls: [ceremonyScroll, ...prev.sacredScrolls],
-    }));
-    await desktopBridge.restoreWindowsWallpaper();
-    setCeremonyScroll(null);
-    setActiveTab('TANG_KINH_CAC');
-    showSternMessage(
-      'ĐẠI SỰ VIÊN THÀNH — ĐÃ CẤT BÍ KÍP VÀO TÀNG KINH CÁC',
-      '“Phong sương đã vượt, đại sự viên thành. Dấu mộc đã đóng, cuốn bí kíp này là minh chứng cho đạo tâm bất động của bạn.” Hình nền Windows gốc đã được khôi phục.',
-      'seal'
-    );
-  };
-
-  // Toggle Ritual Checkbox when Monk Mode is OFF, or start Pomodoro Lock when Monk Mode is ON
-  const handleRitualAction = (ritual: RitualHabitEntity) => {
-    const isDoneToday = Boolean(ritual.completionsByDate[todayStr]);
-
-    if (!db.session.isMonkModeOn) {
-      // Khi Monk Mode: OFF -> Tự giác tích chọn (Checkbox thông thường), cho phép tích hoặc bỏ tích!
-      soundEngine.playWoodenFish(0.65);
-      persistDb((prev) => ({
-        ...prev,
-        ritualHabits: prev.ritualHabits.map((r) => {
-          if (r.id !== ritual.id) return r;
-          const nextCompletions = { ...r.completionsByDate };
-          if (isDoneToday) {
-            delete nextCompletions[todayStr];
-          } else {
-            nextCompletions[todayStr] = {
-              date: todayStr,
-              completedAt: effectiveNow,
-              completedPomodoroMins: r.requiredPomodoroMins,
-              proofPhotoUri: null,
-            };
-          }
-          return {
-            ...r,
-            completionsByDate: nextCompletions,
-          };
+        ritualGroups: (prev.ritualGroups || []).map((g) => {
+          if (g.id !== groupId) return g;
+          const nextItems = [...g.items];
+          const [movedItem] = nextItems.splice(fromIndex, 1);
+          nextItems.splice(targetIndex, 0, movedItem);
+          return { ...g, items: nextItems };
         }),
       }));
-      return;
-    }
+      soundEngine.playWoodenFish(0.7);
+      setDraggingRitualItem(null);
+      setDragOverTargetIndex(null);
+    },
+    [draggingRitualItem, persistDb]
+  );
 
-    if (isDoneToday) return;
+  const handleDragEndRitualItem = useCallback(() => {
+    setDraggingRitualItem(null);
+    setDragOverTargetIndex(null);
+  }, []);
 
-    // Khi Monk Mode: ON -> Bắt buộc Khóa Pomodoro + Chụp ảnh trực tiếp (nếu requiresPhoto)
-    setActivePomodoro({
-      type: 'RITUAL',
-      id: ritual.id,
-      title: ritual.title,
-      requiredMins: ritual.requiredPomodoroMins,
-      requiresPhoto: ritual.requiresPhoto,
-    });
-  };
+  const handleMoveRitualItem = useCallback(
+    (groupId: string, fromIndex: number, direction: 'UP' | 'DOWN') => {
+      const targetIndex = direction === 'UP' ? fromIndex - 1 : fromIndex + 1;
+      persistDb((prev) => ({
+        ...prev,
+        ritualGroups: (prev.ritualGroups || []).map((g) => {
+          if (g.id !== groupId) return g;
+          if (targetIndex < 0 || targetIndex >= g.items.length) return g;
+          const nextItems = [...g.items];
+          const temp = nextItems[fromIndex];
+          nextItems[fromIndex] = nextItems[targetIndex];
+          nextItems[targetIndex] = temp;
+          return { ...g, items: nextItems };
+        }),
+      }));
+      soundEngine.playWoodenFish(0.6);
+    },
+    [persistDb]
+  );
 
-  // Toggle Daily Strike (Todo) Checkbox when Monk Mode is OFF, or start Pomodoro + Live PoW when Monk Mode is ON
-  const handleStrikeAction = (strike: DailyStrikeTodoEntity) => {
-    const isDone = strike.status === 'COMPLETED';
+  const lawConfig = useMemo(() => getLawConfig(db), [db]);
+  const activeShiftMode: WorkShiftMode = lawConfig.workShiftMode || 'DAY';
+  const dayShiftStartTime = getEffectiveDayStartTime(lawConfig);
+  const nightShiftStartTime = getEffectiveNightStartTime(lawConfig);
+  const maxDailyTaskMods = lawConfig.maxDailyTaskModifications ?? 3;
 
-    if (!db.session.isMonkModeOn) {
-      // Khi Monk Mode: OFF -> Tự giác tích chọn (Checkbox thông thường), cộng/trừ trực tiếp % vào Đỉnh Núi!
-      soundEngine.playWoodenFish(0.65);
-      if (!isDone) {
-        completeStrikeAndPushGoal(strike.id, strike.requiredPomodoroMins, null, null);
+  const todayStr = useMemo(
+    () => getShiftDateStr(nowTick, activeShiftMode, nightShiftStartTime),
+    [nowTick, activeShiftMode, nightShiftStartTime]
+  );
+
+  const displayDateVn = useMemo(() => {
+    const d = new Date(nowTick);
+    const day = String(d.getDate()).padStart(2, '0');
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    return `${day}/${month}/${d.getFullYear()}`;
+  }, [nowTick]);
+
+  // Evaluate day turnover automatically while UI is open
+  useEffect(() => {
+    if (!dbLoaded) return;
+    const res = evaluatePendingDays(dbRef.current, todayStr);
+    if (!res.changed) return;
+    setDb(res.db);
+    desktopBridge.saveDatabase(res.db);
+    announceLawVerdict(res);
+  }, [todayStr, dbLoaded, announceLawVerdict]);
+
+  const lawsActive = Boolean(db.session.lawsAcceptedAt);
+  const todayLawPreview = useMemo(
+    () => findDayViolations(db, todayStr, lawConfig),
+    [db, todayStr, lawConfig]
+  );
+
+  const timeLeftToday = useMemo(() => {
+    const isNight = activeShiftMode === 'NIGHT';
+    let endMs: number;
+    let deadlineTitle: string;
+
+    if (!isNight) {
+      const target = new Date(nowTick);
+      target.setHours(23, 59, 59, 999);
+      endMs = target.getTime();
+      deadlineTitle = '23:59 đêm nay';
+    } else {
+      const now = new Date(nowTick);
+      const { hour: nh, minute: nm } = parseShiftStartHM(nightShiftStartTime, 19);
+      const nowMins = now.getHours() * 60 + now.getMinutes();
+      const cutoffMins = nh * 60 + nm;
+      if (nowMins < cutoffMins) {
+        const target = new Date(nowTick);
+        target.setHours(nh, nm, 0, 0);
+        endMs = target.getTime();
+        deadlineTitle = `${nightShiftStartTime} tối nay`;
       } else {
-        // Uncheck in OFF mode
-        persistDb((prev) => {
-          const updatedStrikes = prev.dailyStrikes.map((s) =>
-            s.id === strike.id
-              ? {
-                  ...s,
-                  status: 'PENDING' as const,
-                  completedPomodoroMins: 0,
-                  proofPhotoUri: null,
-                  proofAnalysis: null,
-                }
-              : s
-          );
-          const updatedGoals = prev.peakGoals.map((g, idx) => {
-            if (idx !== 0) return g;
-            const newPct = Math.max(0, g.progressPct - strike.weightPct);
-            const newMetric = Math.round((newPct / 100) * g.targetMetric);
-            return {
-              ...g,
-              progressPct: newPct,
-              currentMetric: newMetric,
-              isCompleted: newPct >= 100,
-            };
-          });
-          return { ...prev, dailyStrikes: updatedStrikes, peakGoals: updatedGoals };
-        });
+        const target = new Date(nowTick + 86400000);
+        target.setHours(nh, nm, 0, 0);
+        endMs = target.getTime();
+        deadlineTitle = `${nightShiftStartTime} tối mai`;
       }
-      return;
     }
 
-    if (isDone) return;
+    const diff = Math.max(0, endMs - nowTick);
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
 
-    // Khi Monk Mode: ON -> Bắt buộc Khóa Pomodoro + Chụp ảnh trực tiếp (Live Camera / Screen Evidence)
-    setActivePomodoro({
-      type: 'STRIKE',
-      id: strike.id,
-      title: strike.title,
-      requiredMins: strike.requiredPomodoroMins,
-      requiresPhoto: true,
-    });
-  };
+    return {
+      h,
+      m,
+      endMs,
+      isNight,
+      label: `${h} giờ ${String(m).padStart(2, '0')} phút`,
+      deadlineTitle,
+    };
+  }, [nowTick, activeShiftMode, nightShiftStartTime]);
 
-  const completeStrikeAndPushGoal = (
-    strikeId: string,
-    completedMins: number,
-    proofUri: string | null,
-    proofAnalysis: ProofAnalysisResult | null
-  ) => {
-    persistDb((prev) => {
-      const targetStrike = prev.dailyStrikes.find((s) => s.id === strikeId);
-      if (!targetStrike || targetStrike.status === 'COMPLETED') return prev;
+  const todayTaskMods = useMemo(() => {
+    const logs = db.taskModificationLogs || [];
+    return logs.filter((l) => l.date === todayStr);
+  }, [db.taskModificationLogs, todayStr]);
+  const remainingTaskMods = Math.max(0, maxDailyTaskMods - todayTaskMods.length);
 
-      const updatedStrikes = prev.dailyStrikes.map((s) =>
-        s.id === strikeId
-          ? {
-              ...s,
-              status: 'COMPLETED' as const,
-              completedPomodoroMins: completedMins,
-              proofPhotoUri: proofUri,
-              proofAnalysis,
-              completedAt: effectiveNow,
-            }
-          : s
-      );
+  const handleUpdateShiftConfig = useCallback(
+    (updates: {
+      mode?: WorkShiftMode;
+      dayShiftStartTime?: string;
+      nightShiftStartTime?: string;
+      silent?: boolean;
+    }) => {
+      const currentCfg = getLawConfig(dbRef.current);
+      const nextMode = updates.mode ?? currentCfg.workShiftMode ?? 'DAY';
+      const nextDayStart = updates.dayShiftStartTime ?? getEffectiveDayStartTime(currentCfg);
+      const nextNightStart = updates.nightShiftStartTime ?? getEffectiveNightStartTime(currentCfg);
+      const parsedNight = parseShiftStartHM(nextNightStart, 19);
 
-      const updatedGoals = prev.peakGoals.map((g, idx) => {
-        if (idx !== 0) return g;
-        const newPct = Math.min(100, g.progressPct + targetStrike.weightPct);
-        const newCurrentMetric = Math.round((newPct / 100) * g.targetMetric);
+      if (!updates.silent) soundEngine.playTempleBell(0.85);
+      persistDb((prev) => {
+        const prevCfg = getLawConfig(prev);
+        const nextPlan = prev.climbingSchedulePlan
+          ? syncPlanPreWorkLock(prev.climbingSchedulePlan, {
+              dayWorkStartTime: nextDayStart,
+              nightWorkStartTime: nextNightStart,
+            })
+          : prev.climbingSchedulePlan;
         return {
-          ...g,
-          progressPct: newPct,
-          currentMetric: newCurrentMetric,
-          isCompleted: newPct >= 100,
+          ...prev,
+          climbingSchedulePlan: nextPlan,
+          session: {
+            ...prev.session,
+            lawConfig: {
+              ...prevCfg,
+              workShiftMode: nextMode,
+              dayShiftStartTime: nextDayStart,
+              nightShiftStartTime: nextNightStart,
+              nightShiftStartHour: parsedNight.hour,
+            },
+          },
         };
       });
+      if (!updates.silent) {
+        if (nextMode === 'NIGHT') {
+          showSternMessage(
+            `🌙 ĐÃ KÍCH HOẠT CA ĐÊM (VÀO CA ${nextNightStart})`,
+            `Hạn chót Luật Núi được điều chỉnh về ${nextNightStart} hôm sau và khung khóa cứng 1 tiếng trước khi đi làm đã tự động cập nhật!`,
+            'seal'
+          );
+        } else {
+          showSternMessage(
+            `☀️ ĐÃ KÍCH HOẠT CA NGÀY (VÀO CA ${nextDayStart})`,
+            `Hạn chót Luật Núi là 23:59 đêm nay và khung khóa cứng 1 tiếng trước giờ vào ca (${nextDayStart}) đã tự động cập nhật!`,
+            'seal'
+          );
+        }
+      }
+    },
+    [persistDb, showSternMessage]
+  );
 
-      return {
-        ...prev,
-        dailyStrikes: updatedStrikes,
-        peakGoals: updatedGoals,
+  const handleSwitchWorkShift = useCallback(
+    (newMode: WorkShiftMode) => handleUpdateShiftConfig({ mode: newMode }),
+    [handleUpdateShiftConfig]
+  );
+
+  // Rest Day Registration & Cancellation (Thẻ Ngày Nghỉ Có Phép)
+  const handleRegisterRestDay = useCallback(
+    (dateStr: string, reason: string) => {
+      const cfg = getLawConfig(dbRef.current);
+      const maxCap = cfg.maxMonthlyRestDays ?? 2;
+      const nowMs = Date.now();
+      const dayEnd = getShiftEndOfDayMs(
+        dateStr,
+        cfg.workShiftMode,
+        getEffectiveNightStartTime(cfg)
+      );
+      if (dateStr < todayStr || nowMs >= dayEnd) {
+        soundEngine.playViolationGong();
+        showSternMessage(
+          'KHÔNG THỂ ĐĂNG KÝ NGÀY ĐÃ QUA',
+          'Thẻ Ngày Nghỉ Có Phép bắt buộc phải đăng ký trước giờ chốt sổ của ngày đó.',
+          'danger'
+        );
+        return;
+      }
+
+      const existing = dbRef.current.session.restDays || [];
+      if (existing.some((r) => r.date === dateStr)) return;
+      const monthPrefix = dateStr.slice(0, 7);
+      const usedCount = existing.filter((r) => r.date.startsWith(monthPrefix)).length;
+      if (usedCount >= maxCap) {
+        soundEngine.playViolationGong();
+        showSternMessage(
+          'HẾT HẠN NGẠCH NGÀY NGHỈ THÁNG NÀY',
+          `Tháng ${monthPrefix} chỉ cho phép tối đa ${maxCap} Thẻ Ngày Nghỉ Có Phép.`,
+          'danger'
+        );
+        return;
+      }
+
+      const record: RestDayRecord = {
+        date: dateStr,
+        reason,
+        registeredAt: nowMs,
       };
-    });
-  };
-
-  const handlePomodoroFinished = (completedMins: number) => {
-    if (!activePomodoro) return;
-    const current = activePomodoro;
-    setActivePomodoro(null);
-
-    if (current.requiresPhoto) {
-      setActiveProof({
-        type: current.type,
-        id: current.id,
-        title: current.title,
-        completedPomodoroMins: completedMins,
-      });
-    } else {
       soundEngine.playWoodblockStampSound();
       persistDb((prev) => ({
         ...prev,
-        ritualHabits: prev.ritualHabits.map((r) =>
-          r.id === current.id
-            ? {
-                ...r,
-                completionsByDate: {
-                  ...r.completionsByDate,
-                  [todayStr]: {
-                    date: todayStr,
-                    completedAt: effectiveNow,
-                    completedPomodoroMins: completedMins,
-                    proofPhotoUri: null,
-                  },
-                },
-              }
-            : r
-        ),
+        session: {
+          ...prev.session,
+          restDays: [record, ...(prev.session.restDays || [])],
+        },
       }));
       showSternMessage(
-        'NGHI THỨC ĐÃ HOÀN TẤT',
-        `Đã hoàn thành khóa thiền định Pomodoro ${completedMins} phút cho Nghi thức: "${current.title}".`,
+        '🎋 ĐÃ CẤP THẺ NGÀY NGHỈ CÓ PHÉP',
+        `Ngày ${dateStr} đã được ghi nhận nghỉ có phép (${reason}). Mọi điều luật trong ngày này được miễn xét và Streak vẫn được giữ nguyên.`,
         'seal'
       );
-    }
-  };
+    },
+    [todayStr, persistDb, showSternMessage]
+  );
 
-  const handleProofConfirmed = (stampedDataUrl: string, analysis: ProofAnalysisResult) => {
-    if (!activeProof) return;
-    const current = activeProof;
-    setActiveProof(null);
-
-    if (current.type === 'RITUAL') {
+  const handleCancelRestDay = useCallback(
+    (dateStr: string) => {
+      const cfg = getLawConfig(dbRef.current);
+      const dayEnd = getShiftEndOfDayMs(
+        dateStr,
+        cfg.workShiftMode,
+        getEffectiveNightStartTime(cfg)
+      );
+      if (Date.now() >= dayEnd) return;
+      soundEngine.playWoodenFish(0.6);
       persistDb((prev) => ({
         ...prev,
-        ritualHabits: prev.ritualHabits.map((r) =>
-          r.id === current.id
-            ? {
-                ...r,
-                completionsByDate: {
-                  ...r.completionsByDate,
-                  [todayStr]: {
-                    date: todayStr,
-                    completedAt: effectiveNow,
-                    completedPomodoroMins: current.completedPomodoroMins,
-                    proofPhotoUri: stampedDataUrl,
-                    proofAnalysis: analysis,
-                  },
-                },
-              }
-            : r
-        ),
+        session: {
+          ...prev.session,
+          restDays: (prev.session.restDays || []).filter((r) => r.date !== dateStr),
+        },
       }));
       showSternMessage(
-        'ĐÃ NGHIỆM THU BẰNG CHỨNG NGHI THỨC',
-        `Bằng chứng hình ảnh hợp lệ (Độ sáng: ${analysis.brightness}, Độ nét: ${analysis.sharpness}). Nghi thức "${current.title}" đã được đóng dấu hoàn thành.`,
-        'seal'
+        'ĐÃ HỦY THẺ NGHỈ CÓ PHÉP',
+        `Ngày ${dateStr} đã quay về ngày kỷ luật bình thường và 1 thẻ tháng đã được hoàn lại.`,
+        'info'
       );
-    } else {
-      completeStrikeAndPushGoal(
-        current.id,
-        current.completedPomodoroMins,
-        stampedDataUrl,
-        analysis
+    },
+    [persistDb, showSternMessage]
+  );
+
+  const handleChangeMaxMonthlyRestDays = useCallback(
+    (cap: number) => {
+      persistDb((prev) => ({
+        ...prev,
+        session: {
+          ...prev.session,
+          lawConfig: { ...getLawConfig(prev), maxMonthlyRestDays: cap },
+        },
+      }));
+    },
+    [persistDb]
+  );
+
+  // Task Modification Quota Handlers
+  const handleRequestEditStrike = useCallback(
+    (strike: DailyStrikeTodoEntity) => {
+      if (remainingTaskMods <= 0) {
+        soundEngine.playViolationGong();
+        setShowQuotaExhaustedModal(true);
+        return;
+      }
+      soundEngine.playWoodenFish(0.6);
+      setStrikeBeingEdited(strike);
+      setEditStrikeTitle(strike.title);
+      setEditStrikePomo(strike.requiredPomodoroMins || 25);
+      setEditStrikeActivityType(
+        inferTodoActivityType(strike, new Map(db.peakGoals.map((g) => [g.id, g])))
       );
-      showSternMessage(
-        'ĐÃ CÔNG PHÁ MỤC TIÊU & ĐẨY TIẾN ĐỘ ĐỈNH NÚI',
-        `Nhiệm vụ "${current.title}" đã vượt qua kiểm duyệt Proof of Work và đẩy tiến độ Đỉnh Núi lên!`,
-        'seal'
-      );
-    }
-  };
+      setEditStrikeRequiresPhoto(Boolean(strike.requiresPhoto));
+    },
+    [remainingTaskMods, db.peakGoals]
+  );
 
-  // Reflection Journal evaluation
-  const journalAnalysis = useMemo(() => {
-    return analyzeReflectionText(journalDraft);
-  }, [journalDraft]);
-
-  const todayJournalSubmitted = useMemo(() => {
-    return db.reflectionJournals.find((j) => j.date === todayStr) || null;
-  }, [db.reflectionJournals, todayStr]);
-
-  const handleSubmitJournal = (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (db.session.isMonkModeOn && !journalAnalysis.isPassingInMonkMode) {
-      soundEngine.playViolationGong();
-      showSternMessage(
-        'BỘ KIỂM DUYỆT TỰ VẤN TỪ CHỐI BẢN GHI (MONK MODE: ON)',
-        journalAnalysis.reason ||
-          'Khi bật Monk Mode, yêu cầu tối thiểu 100 từ hợp lệ và mật độ từ vựng (Lexical Diversity) >= 0.45.',
-        'danger'
-      );
+  const handleConfirmEditStrike = useCallback(() => {
+    if (!strikeBeingEdited || !editStrikeTitle.trim()) return;
+    if (remainingTaskMods <= 0) {
+      setShowQuotaExhaustedModal(true);
       return;
     }
 
-    if (!journalDraft.trim()) {
-      showSternMessage('CHƯA NHẬP NỘI DUNG', 'Hãy nhập nội dung nhật ký Tự Vấn trước khi lưu.', 'danger');
-      return;
-    }
-
-    const entry: ReflectionJournalEntity = {
-      id: `journal-${Date.now()}`,
-      sessionId: db.session.id,
+    const log: TaskModificationLog = {
+      id: `task-mod-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       date: todayStr,
-      content: journalDraft.trim(),
-      validWordCount: journalAnalysis.validWordCount,
-      lexicalDiversityScore: journalAnalysis.lexicalDiversityScore,
-      submittedAt: effectiveNow,
-      focusRating: focusRatingDraft,
-      repentanceNote: repentanceDraft.trim() || 'Giữ vững đạo tâm, không phạm giới luật.',
+      timestamp: Date.now(),
+      type: 'EDIT',
+      goalId: strikeBeingEdited.goalId,
+      goalTitle: db.peakGoals.find((g) => g.id === strikeBeingEdited.goalId)?.title,
+      strikeId: strikeBeingEdited.id,
+      oldTitle: strikeBeingEdited.title,
+      newTitle: editStrikeTitle.trim(),
     };
 
+    persistDb((prev) => ({
+      ...prev,
+      dailyStrikes: prev.dailyStrikes.map((s) =>
+        s.id === strikeBeingEdited.id
+          ? {
+              ...s,
+              title: editStrikeTitle.trim(),
+              requiredPomodoroMins: editStrikePomo,
+              activityType: editStrikeActivityType,
+              requiresPhoto: editStrikeRequiresPhoto,
+            }
+          : s
+      ),
+      taskModificationLogs: [...(prev.taskModificationLogs || []), log],
+    }));
+
+    soundEngine.playTempleBell(0.85);
+    setStrikeBeingEdited(null);
+    showSternMessage(
+      '✏️ ĐÃ CẬP NHẬT NHIỆM VỤ CÔNG PHÁ',
+      `Bạn đã sử dụng 1 lượt sửa đổi. Hôm nay còn lại ${remainingTaskMods - 1}/${maxDailyTaskMods} lượt sửa/hủy. Hãy kiên định tập trung hoàn thành nó!`,
+      'info'
+    );
+  }, [
+    strikeBeingEdited,
+    editStrikeTitle,
+    editStrikePomo,
+    editStrikeActivityType,
+    editStrikeRequiresPhoto,
+    remainingTaskMods,
+    maxDailyTaskMods,
+    todayStr,
+    db.peakGoals,
+    persistDb,
+    showSternMessage,
+  ]);
+
+  const handleRequestDeleteStrike = useCallback(
+    (strike: DailyStrikeTodoEntity) => {
+      if (remainingTaskMods <= 0) {
+        soundEngine.playViolationGong();
+        setShowQuotaExhaustedModal(true);
+        return;
+      }
+      soundEngine.playWoodenFish(0.6);
+      setStrikeBeingDeleted(strike);
+    },
+    [remainingTaskMods]
+  );
+
+  const handleConfirmDeleteStrike = useCallback(() => {
+    if (!strikeBeingDeleted) return;
+    if (remainingTaskMods <= 0) {
+      setShowQuotaExhaustedModal(true);
+      return;
+    }
+
+    const log: TaskModificationLog = {
+      id: `task-mod-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      date: todayStr,
+      timestamp: Date.now(),
+      type: 'DELETE',
+      goalId: strikeBeingDeleted.goalId,
+      goalTitle: db.peakGoals.find((g) => g.id === strikeBeingDeleted.goalId)?.title,
+      strikeId: strikeBeingDeleted.id,
+      oldTitle: strikeBeingDeleted.title,
+    };
+
+    persistDb((prev) => ({
+      ...prev,
+      dailyStrikes: prev.dailyStrikes.filter((s) => s.id !== strikeBeingDeleted.id),
+      taskModificationLogs: [...(prev.taskModificationLogs || []), log],
+    }));
+
+    soundEngine.playWoodblockStampSound();
+    setStrikeBeingDeleted(null);
+    showSternMessage(
+      '🗑️ ĐÃ HỦY BỎ NHIỆM VỤ',
+      `Bạn đã sử dụng 1 lượt hủy Todo hôm nay (còn lại ${remainingTaskMods - 1}/${maxDailyTaskMods} lượt). Hãy suy nghĩ thật kỹ trước khi đặt ra mục tiêu mới!`,
+      'info'
+    );
+  }, [
+    strikeBeingDeleted,
+    remainingTaskMods,
+    maxDailyTaskMods,
+    todayStr,
+    db.peakGoals,
+    persistDb,
+    showSternMessage,
+  ]);
+
+  // Confirm Delete Goal or Ritual Group
+  const handleConfirmDeleteTarget = useCallback(() => {
+    if (!confirmDeleteTarget) return;
+    soundEngine.playWoodblockStampSound();
+    if (confirmDeleteTarget.kind === 'GOAL') {
+      const targetId = confirmDeleteTarget.id;
+      persistDb((prev) => ({
+        ...prev,
+        peakGoals: prev.peakGoals.filter((g) => g.id !== targetId),
+        dailyStrikes: prev.dailyStrikes.filter((s) => s.goalId !== targetId),
+      }));
+      if (selectedGoalId === targetId) setSelectedGoalId(null);
+      showSternMessage(
+        '🗑️ ĐÃ XÓA ĐỈNH NÚI',
+        `Đỉnh núi "${confirmDeleteTarget.title}" đã được xóa khỏi danh sách.`,
+        'info'
+      );
+    } else {
+      const groupId = confirmDeleteTarget.id;
+      persistDb((prev) => ({
+        ...prev,
+        ritualGroups: (prev.ritualGroups || []).filter((g) => g.id !== groupId),
+      }));
+      showSternMessage(
+        '🗑️ ĐÃ XÓA NHÓM NGHI THỨC',
+        `Nhóm "${confirmDeleteTarget.title}" đã được xóa khỏi bảng Nghi Thức.`,
+        'info'
+      );
+    }
+    setConfirmDeleteTarget(null);
+  }, [confirmDeleteTarget, persistDb, selectedGoalId, showSternMessage]);
+
+  const handleAcceptLaws = () => {
     soundEngine.playWoodblockStampSound();
     persistDb((prev) => ({
       ...prev,
       session: {
         ...prev.session,
-        currentStreak: prev.session.currentStreak + 1,
+        lawsAcceptedAt: Date.now(),
+        lastEvaluatedDate: shiftDateStr(todayStr, -1),
+        lawConfig: getLawConfig(prev),
       },
-      reflectionJournals: [entry, ...prev.reflectionJournals],
     }));
-
-    setJournalDraft('');
-    setRepentanceDraft('');
     showSternMessage(
-      'ĐÃ ĐÓNG ẤN NHẬT KÝ TỰ VẤN CUỐI NGÀY',
-      `Đã lưu Tự Vấn (${entry.validWordCount} từ hợp lệ, Lexical Diversity: ${entry.lexicalDiversityScore}). Chuỗi ngày tu luyện tăng lên ${
-        db.session.currentStreak + 1
-      } ngày!`,
+      '📜 ĐÃ KÝ CAM KẾT TUÂN THỦ LUẬT NÚI',
+      `Luật Núi có hiệu lực ngay từ hôm nay. Hệ thống tự động xét duyệt mỗi ngày vào ${
+        activeShiftMode === 'NIGHT' ? `${nightShiftStartTime} tối hôm sau (Ca Đêm)` : '23:59 mỗi đêm'
+      } hoặc ngay khi mở app vào ngày mới.`,
       'seal'
     );
   };
 
-  const showGoalModule = activeTab === 'UNIFIED_4_IN_1' || activeTab === 'PEAK_GOALS';
-  const showRitualsModule = activeTab === 'UNIFIED_4_IN_1' || activeTab === 'RITUALS';
-  const showStrikesModule = activeTab === 'UNIFIED_4_IN_1' || activeTab === 'DAILY_STRIKES';
-  const showReflectionModule = activeTab === 'UNIFIED_4_IN_1' || activeTab === 'REFLECTION';
-  const showArchiveModule = activeTab === 'UNIFIED_4_IN_1' || activeTab === 'TANG_KINH_CAC';
+  const handleToggleLaw = (key: keyof typeof lawConfig) => {
+    soundEngine.playWoodenFish(0.5);
+    persistDb((prev) => {
+      const cfg = getLawConfig(prev);
+      return {
+        ...prev,
+        session: { ...prev.session, lawConfig: { ...cfg, [key]: !cfg[key] } },
+      };
+    });
+  };
+
+  const handleChangeRitualThresholdPct = useCallback(
+    (pct: number) => {
+      const clamped = Math.max(50, Math.min(100, Math.round(pct)));
+      soundEngine.playWoodenFish(0.55);
+      persistDb((prev) => ({
+        ...prev,
+        session: {
+          ...prev.session,
+          lawConfig: { ...getLawConfig(prev), ritualPassThresholdPct: clamped },
+        },
+      }));
+      showSternMessage(
+        `🎯 ĐÃ CẬP NHẬT NGƯỠNG LUẬT 2: ≥ ${clamped}%`,
+        `Từ giờ Luật Nghi Thức yêu cầu hoàn thành tối thiểu ${clamped}% tổng số bước nghi thức trong ngày.`,
+        'seal'
+      );
+    },
+    [persistDb, showSternMessage]
+  );
+
+  const handleToggleRitualItemToday = useCallback(
+    (groupId: string, itemId: string) => {
+      soundEngine.playWoodenFish(0.65);
+      persistDb((prev) => ({
+        ...prev,
+        ritualGroups: (prev.ritualGroups || []).map((g) =>
+          g.id === groupId
+            ? {
+                ...g,
+                items: g.items.map((x) => {
+                  if (x.id !== itemId) return x;
+                  const nextDates = { ...(x.completedDates || {}) };
+                  if (nextDates[todayStr]) {
+                    delete nextDates[todayStr];
+                  } else {
+                    nextDates[todayStr] = Date.now();
+                  }
+                  return { ...x, completedDates: nextDates };
+                }),
+              }
+            : g
+        ),
+      }));
+    },
+    [persistDb, todayStr]
+  );
+
+  const handleRunLawEvaluationTodayNow = () => {
+    const res = evaluateDayImmediately(db, todayStr);
+    setDb(res.db);
+    desktopBridge.saveDatabase(res.db);
+    if (res.newViolations.length > 0) {
+      soundEngine.playViolationGong();
+      setLawVerdict(res);
+      showSternMessage(
+        `🚨 HỆ THỐNG LUẬT NÚI PHÁT HIỆN ${res.newViolations.length} VI PHẠM!`,
+        res.newViolations.map((v) => v.reason).join(' | '),
+        'danger'
+      );
+    } else {
+      soundEngine.playTempleBell(0.85);
+      showSternMessage(
+        '✅ XÉT DUYỆT HÔM NAY HOÀN TẤT — 0 VI PHẠM!',
+        `Bạn đã hoàn thành trọn vẹn nghĩa vụ trong ngày ${todayStr} theo Bộ Luật Núi. Chuỗi ngày kỷ luật hiện tại: ${res.db.session.currentStreak} ngày!`,
+        'seal'
+      );
+    }
+  };
+
+  const selectedGoal: PeakGoalEntity | null = useMemo(() => {
+    if (!selectedGoalId) return null;
+    return db.peakGoals.find((g) => g.id === selectedGoalId) || null;
+  }, [db.peakGoals, selectedGoalId]);
+
+  const focusedStrike: DailyStrikeTodoEntity | null = useMemo(() => {
+    if (!focusedStrikeId) return null;
+    return db.dailyStrikes.find((s) => s.id === focusedStrikeId) || null;
+  }, [db.dailyStrikes, focusedStrikeId]);
+
+  const getLiveRemainingSeconds = useCallback(() => {
+    if (pomoRunning && pomoEndTimeMsRef.current !== null) {
+      return Math.max(0, Math.ceil((pomoEndTimeMsRef.current - Date.now()) / 1000));
+    }
+    return pomoSecondsLeftRef.current;
+  }, [pomoRunning]);
+
+  // Enter Single-Task Focus Mode (restoring saved paused state if present)
+  const enterFocusModeForStrike = useCallback(
+    (strike: DailyStrikeTodoEntity, autoStart: boolean = false) => {
+      setFocusedStrikeId(strike.id);
+      const hasSavedPause =
+        strike.savedPomoSecondsLeft != null &&
+        strike.savedPomoTotalSeconds != null &&
+        strike.savedPomoSecondsLeft > 0 &&
+        strike.savedPomoSecondsLeft < strike.savedPomoTotalSeconds;
+
+      const mins = hasSavedPause
+        ? Math.max(5, strike.savedPomoSelectedMins || Math.round(strike.savedPomoTotalSeconds! / 60))
+        : Math.max(5, strike.requiredPomodoroMins || 25);
+      const totalSecs = hasSavedPause ? strike.savedPomoTotalSeconds! : mins * 60;
+      const leftSecs = hasSavedPause ? strike.savedPomoSecondsLeft! : totalSecs;
+
+      pomoStartMinsRef.current = mins;
+      pomoSecondsLeftRef.current = leftSecs;
+      pomoCompletedGuardRef.current = false;
+      setPomoTotalSeconds(totalSecs);
+      setPomoSecondsLeft(leftSecs);
+      if (autoStart) {
+        pomoEndTimeMsRef.current = Date.now() + leftSecs * 1000;
+        setPomoRunning(true);
+      } else {
+        pomoEndTimeMsRef.current = null;
+        setPomoRunning(false);
+      }
+    },
+    []
+  );
+
+  const handleTogglePomoRun = useCallback(() => {
+    if (pomoRunning) {
+      // Pause: snapshot exact remaining seconds from wall-clock target AND persist to DB
+      const rem =
+        pomoEndTimeMsRef.current !== null
+          ? Math.max(0, Math.ceil((pomoEndTimeMsRef.current - Date.now()) / 1000))
+          : pomoSecondsLeftRef.current;
+      pomoSecondsLeftRef.current = rem;
+      setPomoSecondsLeft(rem);
+      pomoEndTimeMsRef.current = null;
+      setPomoRunning(false);
+
+      if (focusedStrikeId && rem > 0 && rem < pomoTotalSeconds) {
+        const selectedMins = pomoStartMinsRef.current;
+        persistDb((prev) => ({
+          ...prev,
+          dailyStrikes: prev.dailyStrikes.map((s) =>
+            s.id === focusedStrikeId
+              ? {
+                  ...s,
+                  status: s.status === 'COMPLETED' ? 'COMPLETED' : 'IN_PROGRESS',
+                  savedPomoSecondsLeft: rem,
+                  savedPomoTotalSeconds: pomoTotalSeconds,
+                  savedPomoSelectedMins: selectedMins,
+                }
+              : s
+          ),
+        }));
+      }
+    } else {
+      const secs =
+        pomoSecondsLeftRef.current > 0
+          ? pomoSecondsLeftRef.current
+          : pomoStartMinsRef.current * 60;
+      pomoCompletedGuardRef.current = false;
+      pomoSecondsLeftRef.current = secs;
+      pomoEndTimeMsRef.current = Date.now() + secs * 1000;
+      soundEngine.playTempleBell(0.85);
+      setPomoRunning(true);
+    }
+  }, [pomoRunning, focusedStrikeId, pomoTotalSeconds, persistDb]);
+
+  const handleExitFocusMode = useCallback(() => {
+    if (focusedStrikeId) {
+      const rem = getLiveRemainingSeconds();
+      const selectedMins = pomoStartMinsRef.current;
+      if (rem > 0 && rem < pomoTotalSeconds) {
+        persistDb((prev) => ({
+          ...prev,
+          dailyStrikes: prev.dailyStrikes.map((s) =>
+            s.id === focusedStrikeId
+              ? {
+                  ...s,
+                  status: s.status === 'COMPLETED' ? 'COMPLETED' : 'IN_PROGRESS',
+                  savedPomoSecondsLeft: rem,
+                  savedPomoTotalSeconds: pomoTotalSeconds,
+                  savedPomoSelectedMins: selectedMins,
+                }
+              : s
+          ),
+        }));
+      } else {
+        persistDb((prev) => ({
+          ...prev,
+          dailyStrikes: prev.dailyStrikes.map((s) =>
+            s.id === focusedStrikeId
+              ? {
+                  ...s,
+                  savedPomoSecondsLeft: null,
+                  savedPomoTotalSeconds: null,
+                  savedPomoSelectedMins: null,
+                }
+              : s
+          ),
+        }));
+      }
+    }
+    pomoEndTimeMsRef.current = null;
+    setPomoRunning(false);
+    setFocusedStrikeId(null);
+  }, [focusedStrikeId, getLiveRemainingSeconds, pomoTotalSeconds, persistDb]);
+
+  const handleResetPomoTimer = useCallback(
+    (minsOverride?: number) => {
+      const mins = minsOverride ?? pomoStartMinsRef.current;
+      const secs = mins * 60;
+      pomoEndTimeMsRef.current = null;
+      pomoCompletedGuardRef.current = false;
+      pomoSecondsLeftRef.current = secs;
+      setPomoRunning(false);
+      setPomoTotalSeconds(secs);
+      setPomoSecondsLeft(secs);
+      if (focusedStrikeId) {
+        persistDb((prev) => ({
+          ...prev,
+          dailyStrikes: prev.dailyStrikes.map((s) =>
+            s.id === focusedStrikeId
+              ? {
+                  ...s,
+                  savedPomoSecondsLeft: null,
+                  savedPomoTotalSeconds: null,
+                  savedPomoSelectedMins: null,
+                }
+              : s
+          ),
+        }));
+      }
+    },
+    [focusedStrikeId, persistDb]
+  );
+
+  const startBreakTimer = useCallback((mins: number = 5) => {
+    const secs = Math.max(60, Math.round(mins * 60));
+    breakEndTimeMsRef.current = Date.now() + secs * 1000;
+    setBreakTotalSeconds(secs);
+    setBreakSecondsLeft(secs);
+  }, []);
+
+  const cancelBreakTimer = useCallback(() => {
+    breakEndTimeMsRef.current = null;
+    setBreakSecondsLeft(null);
+  }, []);
+
+  const handleChangeAmbientMode = useCallback(
+    (mode: AmbientSoundMode) => {
+      setAmbientMode(mode);
+      soundEngine.setAmbientSound(mode, ambientVolume);
+    },
+    [ambientVolume]
+  );
+
+  const handleChangeAmbientVolume = useCallback((vol: number) => {
+    setAmbientVolume(vol);
+    soundEngine.setAmbientVolume(vol);
+  }, []);
+
+  const handleFinishActualPomoSession = useCallback(() => {
+    if (!focusedStrikeId) return;
+    const rem = getLiveRemainingSeconds();
+    const elapsedSecs = Math.max(0, pomoTotalSeconds - rem);
+    if (elapsedSecs <= 0) {
+      soundEngine.playWoodenFish(0.5);
+      showSternMessage(
+        'CHƯA CÓ THỜI GIAN TẬP TRUNG THỰC TẾ',
+        'Đồng hồ chưa chạy giây nào trong hiệp này. Hãy bấm "Bắt Đầu Pomodoro" trước rồi hoàn thành hiệp khi đạt mục tiêu!',
+        'info'
+      );
+      return;
+    }
+
+    const earnedMins = Math.max(1, Math.round(elapsedSecs / 60));
+    const plannedMins = pomoStartMinsRef.current;
+    soundEngine.playTempleBell(0.95);
+    handleResetPomoTimer(plannedMins);
+    const endedNow = Date.now();
+    persistDb((prev) => {
+      const targetStrike = prev.dailyStrikes.find((s) => s.id === focusedStrikeId);
+      const nextLogs = targetStrike
+        ? [
+            buildFocusSessionLog(
+              targetStrike,
+              earnedMins,
+              'POMODORO_EARLY_FINISH',
+              todayStr,
+              prev.peakGoals,
+              endedNow
+            ),
+            ...(prev.focusSessionLogs || []),
+          ]
+        : prev.focusSessionLogs || [];
+      return {
+        ...prev,
+        focusSessionLogs: nextLogs,
+        dailyStrikes: prev.dailyStrikes.map((s) =>
+          s.id === focusedStrikeId
+            ? {
+                ...s,
+                status: s.status === 'COMPLETED' ? 'COMPLETED' : 'IN_PROGRESS',
+                completedPomodoroMins: (s.completedPomodoroMins || 0) + earnedMins,
+                pomodoroSessionsCount: (s.pomodoroSessionsCount || 0) + 1,
+                savedPomoSecondsLeft: null,
+                savedPomoTotalSeconds: null,
+                savedPomoSelectedMins: null,
+              }
+            : s
+        ),
+      };
+    });
+    startBreakTimer(5);
+    showSternMessage(
+      '✓ ĐÃ HOÀN THÀNH HIỆP POMODORO!',
+      `Đã ghi nhận đúng ${earnedMins} phút tập trung thực tế vào Sổ Quỹ Thời Gian & hồ sơ (mục tiêu hiệp đặt ${plannedMins}p).`,
+      'seal'
+    );
+  }, [
+    focusedStrikeId,
+    getLiveRemainingSeconds,
+    pomoTotalSeconds,
+    handleResetPomoTimer,
+    persistDb,
+    todayStr,
+    startBreakTimer,
+    showSternMessage,
+  ]);
+
+  // Anti-Drift Pomodoro Countdown Loop using endTimeMs + visibilitychange / focus sync
+  useEffect(() => {
+    if (!pomoRunning || !focusedStrikeId) return;
+
+    if (pomoEndTimeMsRef.current === null) {
+      pomoEndTimeMsRef.current = Date.now() + pomoSecondsLeftRef.current * 1000;
+    }
+
+    const syncRemaining = () => {
+      if (!pomoEndTimeMsRef.current || pomoCompletedGuardRef.current) return;
+      const rem = Math.max(0, Math.ceil((pomoEndTimeMsRef.current - Date.now()) / 1000));
+      pomoSecondsLeftRef.current = rem;
+      setPomoSecondsLeft(rem);
+
+      if (rem <= 0) {
+        pomoCompletedGuardRef.current = true;
+        pomoEndTimeMsRef.current = null;
+        soundEngine.playTempleBell(1.0);
+        setPomoRunning(false);
+        const earned = pomoStartMinsRef.current;
+        pomoSecondsLeftRef.current = earned * 60;
+        setPomoTotalSeconds(earned * 60);
+        setPomoSecondsLeft(earned * 60);
+        const endedNow = Date.now();
+
+        persistDb((prev) => {
+          const targetStrike = prev.dailyStrikes.find((s) => s.id === focusedStrikeId);
+          const nextLogs = targetStrike
+            ? [
+                buildFocusSessionLog(
+                  targetStrike,
+                  earned,
+                  'POMODORO_FULL',
+                  todayStr,
+                  prev.peakGoals,
+                  endedNow
+                ),
+                ...(prev.focusSessionLogs || []),
+              ]
+            : prev.focusSessionLogs || [];
+          return {
+            ...prev,
+            focusSessionLogs: nextLogs,
+            dailyStrikes: prev.dailyStrikes.map((s) =>
+              s.id === focusedStrikeId
+                ? {
+                    ...s,
+                    status: s.status === 'COMPLETED' ? 'COMPLETED' : 'IN_PROGRESS',
+                    completedPomodoroMins: (s.completedPomodoroMins || 0) + earned,
+                    pomodoroSessionsCount: (s.pomodoroSessionsCount || 0) + 1,
+                    savedPomoSecondsLeft: null,
+                    savedPomoTotalSeconds: null,
+                    savedPomoSelectedMins: null,
+                  }
+                : s
+            ),
+          };
+        });
+        startBreakTimer(5);
+        showSternMessage(
+          '🔔 HOÀN THÀNH 1 HIỆP POMODORO!',
+          `Tuyệt vời! Đã cộng +${earned} phút tập trung thực tế vào Sổ Quỹ Thời Gian & kích hoạt đồng hồ nghỉ ngắn 5 phút.`,
+          'seal'
+        );
+      }
+    };
+
+    const handleBeforeUnload = () => {
+      if (!pomoEndTimeMsRef.current || pomoCompletedGuardRef.current) return;
+      const rem = Math.max(0, Math.ceil((pomoEndTimeMsRef.current - Date.now()) / 1000));
+      if (rem > 0 && rem < pomoTotalSeconds) {
+        const nextDb: MonkDatabaseSchema = {
+          ...dbRef.current,
+          dailyStrikes: dbRef.current.dailyStrikes.map((s) =>
+            s.id === focusedStrikeId
+              ? {
+                  ...s,
+                  status: s.status === 'COMPLETED' ? 'COMPLETED' : 'IN_PROGRESS',
+                  savedPomoSecondsLeft: rem,
+                  savedPomoTotalSeconds: pomoTotalSeconds,
+                  savedPomoSelectedMins: pomoStartMinsRef.current,
+                }
+              : s
+          ),
+        };
+        desktopBridge.saveDatabase(nextDb, true);
+      }
+    };
+
+    syncRemaining();
+    const timer = window.setInterval(syncRemaining, 250);
+    window.addEventListener('focus', syncRemaining);
+    document.addEventListener('visibilitychange', syncRemaining);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', syncRemaining);
+      document.removeEventListener('visibilitychange', syncRemaining);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [pomoRunning, focusedStrikeId, pomoTotalSeconds, persistDb, todayStr, startBreakTimer, showSternMessage]);
+
+  // Auto-Break Countdown Loop (timestamp-anchored)
+  useEffect(() => {
+    if (breakSecondsLeft === null) return;
+    const tickBreak = () => {
+      if (!breakEndTimeMsRef.current) return;
+      const rem = Math.max(0, Math.ceil((breakEndTimeMsRef.current - Date.now()) / 1000));
+      if (rem <= 0) {
+        breakEndTimeMsRef.current = null;
+        setBreakSecondsLeft(null);
+        soundEngine.playTempleBell(0.75);
+        showSternMessage(
+          '⏰ HẾT GIỜ NGHỈ NGẮN!',
+          'Đã hết giờ nghỉ phục hồi. Bấm Space hoặc Bắt Đầu để quay lại hiệp Pomodoro tiếp theo!',
+          'info'
+        );
+      } else {
+        setBreakSecondsLeft(rem);
+      }
+    };
+    const id = window.setInterval(tickBreak, 500);
+    return () => window.clearInterval(id);
+  }, [breakSecondsLeft !== null, showSternMessage]);
+
+  // Dynamic Window / Browser Tab Title with Live Countdown
+  useEffect(() => {
+    if (focusedStrike && pomoRunning) {
+      const mm = String(Math.floor(pomoSecondsLeft / 60)).padStart(2, '0');
+      const ss = String(pomoSecondsLeft % 60).padStart(2, '0');
+      document.title = `[${mm}:${ss}] 🔥 ${focusedStrike.title} — Lên Núi`;
+    } else if (breakSecondsLeft !== null) {
+      const mm = String(Math.floor(breakSecondsLeft / 60)).padStart(2, '0');
+      const ss = String(breakSecondsLeft % 60).padStart(2, '0');
+      document.title = `[Nghỉ ${mm}:${ss}] 🍵 Nghỉ ngắn — Lên Núi`;
+    } else {
+      document.title = 'LÊN NÚI (ASCEND THE MOUNTAIN) — Hệ Thống Kỷ Luật Tu Luyện';
+    }
+  }, [focusedStrike, pomoRunning, pomoSecondsLeft, breakSecondsLeft]);
+
+  // Global Keyboard Shortcuts (Ctrl+K, Ctrl+1..9, Space/Esc in Focus Mode)
+  useEffect(() => {
+    const tabMap: OuterNavTab[] = [
+      'GOALS_LIST',
+      'AI_SCHEDULE',
+      'TIME_AUDIT',
+      'OPTIMIZATION_VAULT',
+      'SIDE_QUESTS',
+      'RITUALS',
+      'LAWS',
+      'TANG_KINH_CAC',
+      'SETTINGS',
+    ];
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCommandPaletteOpen((v) => !v);
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+        const num = Number(e.key);
+        if (num >= 1 && num <= 9 && tabMap[num - 1]) {
+          e.preventDefault();
+          setFocusedStrikeId(null);
+          setSelectedGoalId(null);
+          setOuterTab(tabMap[num - 1]);
+          return;
+        }
+      }
+
+      if (commandPaletteOpen) return;
+
+      if (focusedStrikeId && !isTyping) {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          handleTogglePomoRun();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          handleExitFocusMode();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [commandPaletteOpen, focusedStrikeId, handleTogglePomoRun, handleExitFocusMode]);
+
+  const getMountainStats = useCallback(
+    (goalId: string): MountainStats => {
+      const goalStrikes = db.dailyStrikes.filter((s) => s.goalId === goalId);
+      const completedStrikes = goalStrikes.filter((s) => s.status === 'COMPLETED');
+      const todayPendingStrikes = goalStrikes.filter((s) => s.status !== 'COMPLETED');
+      const totalPomoMins = goalStrikes.reduce(
+        (sum, s) => sum + (s.completedPomodoroMins || 0),
+        0
+      );
+      const totalPomoHours = Number((totalPomoMins / 60).toFixed(1));
+
+      let proofPhotosCount = 0;
+      for (const s of goalStrikes) {
+        if (s.proofPhotosList && s.proofPhotosList.length > 0) {
+          proofPhotosCount += s.proofPhotosList.length;
+        } else if (s.proofPhotoUri) {
+          proofPhotosCount += 1;
+        }
+      }
+
+      return {
+        totalStrikes: goalStrikes.length,
+        completedCount: completedStrikes.length,
+        pendingCount: todayPendingStrikes.length,
+        totalPomoMins,
+        totalPomoHours,
+        proofPhotosCount,
+        journalsCount: db.reflectionJournals.filter((j) => j.goalId === goalId).length,
+        violationsCount: db.violations.filter((v) => v.goalId === goalId).length,
+      };
+    },
+    [db.dailyStrikes, db.reflectionJournals, db.violations]
+  );
+
+  // Ritual Groups stats today (respecting weekday schedule)
+  const ritualStatsToday = useMemo(() => {
+    const groups = db.ritualGroups || [];
+    let totalItems = 0;
+    let completedItems = 0;
+    for (const g of groups) {
+      for (const item of g.items) {
+        if (!isRitualScheduledForDate(item, todayStr)) continue;
+        totalItems++;
+        if (item.completedDates?.[todayStr]) {
+          completedItems++;
+        }
+      }
+    }
+    const pct = totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 100;
+    return {
+      totalItems,
+      completedItems,
+      pct: totalItems === 0 ? 0 : pct,
+      groupCount: groups.length,
+    };
+  }, [db.ritualGroups, todayStr]);
+
+  // Goal Create / Edit Handlers
+  const handleOpenCreateGoalModal = () => {
+    setEditingGoalId(null);
+    setGoalTitleDraft('');
+    setGoalCategoryDraft('Ngoại Ngữ & Chứng Chỉ');
+    setGoalDescDraft('');
+    setGoalVowDraft(
+      'Tương lai nhìn lại sẽ là cảm ơn vì hôm nay đã nỗ lực hết mình, chứ không phải hai chữ "Giá như..."'
+    );
+    setGoalHasDeadlineDraft(false);
+    const defaultDate = new Date(Date.now() + 60 * 86400000);
+    setGoalTargetDateDraft(getTodayDateStr(defaultDate.getTime()));
+    setGoalMilestonesDraft([]);
+    setNewMilestoneText('');
+    setGoalModalOpen(true);
+  };
+
+  const handleOpenEditGoalModal = (goal: PeakGoalEntity) => {
+    setEditingGoalId(goal.id);
+    setGoalTitleDraft(goal.title);
+    setGoalCategoryDraft(goal.category || 'Mục Tiêu Trọng Điểm');
+    setGoalDescDraft(goal.description);
+    setGoalVowDraft(
+      goal.futureSelfVow ||
+        'Tương lai nhìn lại sẽ là cảm ơn vì hôm nay đã nỗ lực hết mình, chứ không phải hai chữ "Giá như..."'
+    );
+    if (goal.targetEndTime || goal.targetDays) {
+      setGoalHasDeadlineDraft(true);
+      const ms = goal.targetEndTime || goal.createdAt + (goal.targetDays || 60) * 86400000;
+      setGoalTargetDateDraft(getTodayDateStr(ms));
+    } else {
+      setGoalHasDeadlineDraft(false);
+      const defaultDate = new Date(Date.now() + 60 * 86400000);
+      setGoalTargetDateDraft(getTodayDateStr(defaultDate.getTime()));
+    }
+    setGoalMilestonesDraft(goal.milestones && goal.milestones.length > 0 ? [...goal.milestones] : []);
+    setNewMilestoneText('');
+    setGoalModalOpen(true);
+  };
+
+  const handleSaveGoalModal = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!goalTitleDraft.trim()) return;
+
+    const cleanMilestones = goalMilestonesDraft.filter((m) => m.title.trim().length > 0);
+    const completedMsCount = cleanMilestones.filter((m) => m.isCompleted).length;
+    const computedPct =
+      cleanMilestones.length > 0 ? Math.round((completedMsCount / cleanMilestones.length) * 100) : 0;
+
+    let finalTargetDays: number | undefined = undefined;
+    let finalTargetEndTime: number | undefined = undefined;
+    if (goalHasDeadlineDraft && goalTargetDateDraft) {
+      const [y, m, d] = goalTargetDateDraft.split('-').map(Number);
+      const targetMs = new Date(y, m - 1, d, 23, 59, 59, 999).getTime();
+      finalTargetEndTime = targetMs;
+      const baseTime = editingGoalId
+        ? db.peakGoals.find((g) => g.id === editingGoalId)?.createdAt || nowTick
+        : nowTick;
+      finalTargetDays = Math.max(1, Math.ceil((targetMs - baseTime) / 86400000));
+    }
+
+    if (editingGoalId) {
+      persistDb((prev) => ({
+        ...prev,
+        peakGoals: prev.peakGoals.map((g) =>
+          g.id === editingGoalId
+            ? {
+                ...g,
+                title: goalTitleDraft.trim(),
+                category: goalCategoryDraft.trim() || 'Mục Tiêu Lớn',
+                description: goalDescDraft.trim(),
+                futureSelfVow: goalVowDraft.trim(),
+                targetDays: finalTargetDays,
+                targetEndTime: finalTargetEndTime,
+                milestones: cleanMilestones,
+                targetMetric: Math.max(1, cleanMilestones.length),
+                currentMetric: completedMsCount,
+                progressPct: computedPct,
+              }
+            : g
+        ),
+      }));
+      showSternMessage(
+        'ĐÃ CẬP NHẬT ĐỈNH NÚI',
+        `Đã lưu thay đổi cho ngọn núi: "${goalTitleDraft.trim()}".`,
+        'info'
+      );
+    } else {
+      const newGoal: PeakGoalEntity = {
+        id: `goal-${Date.now()}`,
+        sessionId: db.session.id,
+        title: goalTitleDraft.trim(),
+        category: goalCategoryDraft.trim() || 'Mục Tiêu Lớn',
+        description: goalDescDraft.trim() || 'Mục tiêu trọng điểm cần chinh phục dứt điểm.',
+        futureSelfVow:
+          goalVowDraft.trim() ||
+          'Tương lai nhìn lại sẽ là cảm ơn vì đã nỗ lực, chứ không phải là "Giá như..."',
+        unit: 'mục',
+        targetMetric: Math.max(1, cleanMilestones.length),
+        currentMetric: completedMsCount,
+        progressPct: computedPct,
+        targetDays: finalTargetDays,
+        targetEndTime: finalTargetEndTime,
+        milestones: cleanMilestones,
+        isCompleted: false,
+        createdAt: nowTick,
+      };
+      soundEngine.playTempleBell(0.85);
+      persistDb((prev) => ({
+        ...prev,
+        peakGoals: [newGoal, ...prev.peakGoals],
+      }));
+      showSternMessage(
+        '⛰️ ĐÃ DỰNG NGỌN NÚI MỚI ĐỂ CHINH PHỤC!',
+        `Ngọn núi "${newGoal.title}" đã sẵn sàng. Hãy bấm vào ngọn núi để bắt đầu lên danh sách Công Phá mỗi ngày!`,
+        'seal'
+      );
+    }
+    setGoalModalOpen(false);
+  };
+
+  // Checklist Handlers
+  const handleToggleMilestone = (goalId: string, milestoneId: string) => {
+    soundEngine.playWoodenFish(0.65);
+    persistDb((prev) => ({
+      ...prev,
+      peakGoals: prev.peakGoals.map((g) => {
+        if (g.id !== goalId || !g.milestones) return g;
+        const nextMilestones = g.milestones.map((m) =>
+          m.id === milestoneId
+            ? {
+                ...m,
+                isCompleted: !m.isCompleted,
+                completedAt: !m.isCompleted ? nowTick : undefined,
+              }
+            : m
+        );
+        const doneCount = nextMilestones.filter((m) => m.isCompleted).length;
+        const pct =
+          nextMilestones.length > 0 ? Math.round((doneCount / nextMilestones.length) * 100) : 0;
+        return {
+          ...g,
+          milestones: nextMilestones,
+          currentMetric: doneCount,
+          targetMetric: nextMilestones.length,
+          progressPct: pct,
+        };
+      }),
+    }));
+  };
+
+  const handleQuickAddChecklistItem = (goalId: string, rawTitle: string) => {
+    const title = rawTitle.trim();
+    if (!title) return;
+    soundEngine.playWoodenFish(0.65);
+    persistDb((prev) => ({
+      ...prev,
+      peakGoals: prev.peakGoals.map((g) => {
+        if (g.id !== goalId) return g;
+        const nextList: MountainMilestoneItem[] = [
+          ...(g.milestones || []),
+          {
+            id: `chk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title,
+            isCompleted: false,
+          },
+        ];
+        const doneCount = nextList.filter((m) => m.isCompleted).length;
+        return {
+          ...g,
+          unit: 'mục',
+          milestones: nextList,
+          currentMetric: doneCount,
+          targetMetric: nextList.length,
+          progressPct: Math.round((doneCount / nextList.length) * 100),
+        };
+      }),
+    }));
+  };
+
+  const handleDeleteChecklistItem = (goalId: string, itemId: string) => {
+    soundEngine.playWoodenFish(0.5);
+    persistDb((prev) => ({
+      ...prev,
+      peakGoals: prev.peakGoals.map((g) => {
+        if (g.id !== goalId) return g;
+        const nextList = (g.milestones || []).filter((m) => m.id !== itemId);
+        const doneCount = nextList.filter((m) => m.isCompleted).length;
+        return {
+          ...g,
+          milestones: nextList,
+          currentMetric: doneCount,
+          targetMetric: nextList.length,
+          progressPct: nextList.length > 0 ? Math.round((doneCount / nextList.length) * 100) : 0,
+        };
+      }),
+    }));
+  };
+
+  // Conquer Ceremony
+  const handleLaunchConquerMountainCeremony = (goal: PeakGoalEntity) => {
+    soundEngine.playTempleBell(1.0);
+    const goalStrikes = db.dailyStrikes.filter((s) => s.goalId === goal.id);
+    const goalJournals = db.reflectionJournals.filter((j) => j.goalId === goal.id);
+    const goalViolations = db.violations.filter((v) => v.goalId === goal.id);
+    const totalPomoMins = goalStrikes.reduce(
+      (sum, s) => sum + (s.completedPomodoroMins || 0),
+      0
+    );
+    const totalHours = Number((totalPomoMins / 60).toFixed(1));
+    const daysSpent = Math.max(
+      1,
+      Math.ceil((nowTick - (goal.createdAt || db.session.startTime)) / 86400000)
+    );
+    let totalProofPhotos = 0;
+    for (const s of goalStrikes) {
+      if (s.proofPhotosList && s.proofPhotosList.length > 0) {
+        totalProofPhotos += s.proofPhotosList.length;
+      } else if (s.proofPhotoUri) {
+        totalProofPhotos += 1;
+      }
+    }
+
+    const completedGoalSnapshot: PeakGoalEntity = {
+      ...goal,
+      progressPct: 100,
+      isCompleted: true,
+      completedAt: nowTick,
+      milestones: (goal.milestones || []).map((m) => ({ ...m, isCompleted: true })),
+    };
+
+    const newScroll: SacredScrollEntity = {
+      id: `scroll-${Date.now()}`,
+      sessionId: db.session.id,
+      goalId: goal.id,
+      title: `Chứng Nhận Chinh Phục: ${goal.title}`,
+      mottoText: goal.futureSelfVow || db.session.mottoText,
+      futureSelfVow: goal.futureSelfVow || db.session.mottoText,
+      sealedAt: nowTick,
+      totalDaysSpent: daysSpent,
+      initialDaysCommitted: goal.targetDays || db.session.initialDays,
+      totalPomodoroHours: totalHours,
+      totalCompletedTodos: goalStrikes.filter((s) => s.status === 'COMPLETED').length,
+      totalProofPhotos,
+      totalJournals: goalJournals.length,
+      violationCount: goalViolations.length,
+      sealHash: `CHU-SA-${Math.random().toString(16).substring(2, 10).toUpperCase()}`,
+      snapshotJson: JSON.stringify({
+        session: db.session,
+        goals: [completedGoalSnapshot],
+        rituals: [],
+        ritualGroups: db.ritualGroups || [],
+        strikes: goalStrikes,
+        journals: goalJournals,
+        violations: goalViolations,
+      }),
+      exportedPdfUri: null,
+    };
+
+    setConqueringGoalId(goal.id);
+    setCeremonyScroll(newScroll);
+  };
+
+  const handleFinishConquerCeremony = () => {
+    if (!ceremonyScroll) return;
+    persistDb((prev) => ({
+      ...prev,
+      peakGoals: prev.peakGoals.map((g) =>
+        g.id === conqueringGoalId
+          ? {
+              ...g,
+              progressPct: 100,
+              isCompleted: true,
+              completedAt: nowTick,
+              milestones: (g.milestones || []).map((m) => ({ ...m, isCompleted: true })),
+            }
+          : g
+      ),
+      sacredScrolls: [
+        ceremonyScroll,
+        ...prev.sacredScrolls.filter((s) => s.goalId !== conqueringGoalId),
+      ],
+    }));
+    setCeremonyScroll(null);
+    setConqueringGoalId(null);
+    setSelectedGoalId(null);
+    setOuterTab('TANG_KINH_CAC');
+    showSternMessage(
+      '🏆 ĐẠI SỰ VIÊN THÀNH — ĐÃ LƯU CHỨNG NHẬN VÀO TÀNG KINH CÁC!',
+      'Toàn bộ lịch sử Todo Công Phá, chuỗi ảnh bằng chứng theo mốc thời gian và nhật ký Tự Vấn của Đỉnh Núi đã được đóng dấu lưu trữ vĩnh viễn.',
+      'seal'
+    );
+  };
+
+  // PoW & Strike Completion Handlers
+  const handleToggleStrikeRequiresPhoto = (strikeId: string) => {
+    soundEngine.playWoodenFish(0.5);
+    persistDb((prev) => ({
+      ...prev,
+      dailyStrikes: prev.dailyStrikes.map((s) =>
+        s.id === strikeId ? { ...s, requiresPhoto: !s.requiresPhoto } : s
+      ),
+    }));
+  };
+
+  const getUnsavedActualMinsForStrike = useCallback(
+    (strike: DailyStrikeTodoEntity): number => {
+      if (focusedStrikeId === strike.id) {
+        const rem = getLiveRemainingSeconds();
+        const elapsedSecs = Math.max(0, pomoTotalSeconds - rem);
+        return elapsedSecs > 0 ? Math.max(1, Math.round(elapsedSecs / 60)) : 0;
+      }
+      if (strike.savedPomoSecondsLeft != null && strike.savedPomoTotalSeconds != null) {
+        const elapsedSecs = Math.max(
+          0,
+          strike.savedPomoTotalSeconds - strike.savedPomoSecondsLeft
+        );
+        return elapsedSecs > 0 ? Math.max(1, Math.round(elapsedSecs / 60)) : 0;
+      }
+      return 0;
+    },
+    [focusedStrikeId, getLiveRemainingSeconds, pomoTotalSeconds]
+  );
+
+  const handleCompleteStrikeAction = (strike: DailyStrikeTodoEntity) => {
+    const isDone = strike.status === 'COMPLETED';
+    if (isDone) {
+      soundEngine.playWoodenFish(0.5);
+      persistDb((prev) => ({
+        ...prev,
+        dailyStrikes: prev.dailyStrikes.map((s) =>
+          s.id === strike.id ? { ...s, status: 'IN_PROGRESS' } : s
+        ),
+      }));
+      return;
+    }
+
+    const hasPhoto =
+      Boolean(strike.proofPhotoUri) ||
+      Boolean(strike.proofPhotosList && strike.proofPhotosList.length > 0);
+    if (strike.requiresPhoto && !hasPhoto) {
+      setProofModalTarget({
+        strikeId: strike.id,
+        title: strike.title,
+        markCompleteAfterProof: true,
+      });
+      return;
+    }
+
+    const extraMins = getUnsavedActualMinsForStrike(strike);
+    if (focusedStrikeId === strike.id) {
+      handleResetPomoTimer(pomoStartMinsRef.current);
+    }
+
+    const doneNow = Date.now();
+    soundEngine.playWoodblockStampSound();
+    persistDb((prev) => ({
+      ...prev,
+      focusSessionLogs:
+        extraMins > 0
+          ? [
+              buildFocusSessionLog(
+                strike,
+                extraMins,
+                'POMODORO_EARLY_FINISH',
+                todayStr,
+                prev.peakGoals,
+                doneNow
+              ),
+              ...(prev.focusSessionLogs || []),
+            ]
+          : prev.focusSessionLogs || [],
+      dailyStrikes: prev.dailyStrikes.map((s) =>
+        s.id === strike.id
+          ? {
+              ...s,
+              status: 'COMPLETED',
+              completedAt: doneNow,
+              completedPomodoroMins: (s.completedPomodoroMins || 0) + extraMins,
+              pomodoroSessionsCount:
+                extraMins > 0 ? (s.pomodoroSessionsCount || 0) + 1 : s.pomodoroSessionsCount || 0,
+              savedPomoSecondsLeft: null,
+              savedPomoTotalSeconds: null,
+              savedPomoSelectedMins: null,
+            }
+          : s
+      ),
+    }));
+  };
+
+  const handleProofConfirmed = async (
+    stampedDataUrl: string,
+    analysis: ProofAnalysisResult,
+    caption: string
+  ) => {
+    if (!proofModalTarget) return;
+    const { strikeId, markCompleteAfterProof } = proofModalTarget;
+    setProofModalTarget(null);
+
+    // Upload image to external storage (/api/proofs/upload -> filename in data/proofs/)
+    const storedUri = await desktopBridge.uploadProofImage(stampedDataUrl, 'pow');
+
+    const targetStrike = dbRef.current.dailyStrikes.find((s) => s.id === strikeId);
+    const extraMins =
+      markCompleteAfterProof && targetStrike ? getUnsavedActualMinsForStrike(targetStrike) : 0;
+    if (markCompleteAfterProof && focusedStrikeId === strikeId) {
+      handleResetPomoTimer(pomoStartMinsRef.current);
+    }
+
+    const powNow = Date.now();
+    soundEngine.playWoodblockStampSound();
+    persistDb((prev) => ({
+      ...prev,
+      focusSessionLogs:
+        extraMins > 0 && targetStrike
+          ? [
+              buildFocusSessionLog(
+                targetStrike,
+                extraMins,
+                'POMODORO_EARLY_FINISH',
+                todayStr,
+                prev.peakGoals,
+                powNow
+              ),
+              ...(prev.focusSessionLogs || []),
+            ]
+          : prev.focusSessionLogs || [],
+      dailyStrikes: prev.dailyStrikes.map((s) => {
+        if (s.id !== strikeId) return s;
+        const nextCompletedMins = (s.completedPomodoroMins || 0) + extraMins;
+        const newPhotoItem: StrikeProofPhotoItem = {
+          id: `proof-${powNow}`,
+          uri: storedUri,
+          caption: caption || s.title,
+          capturedAt: powNow,
+          pomodoroMins: nextCompletedMins,
+        };
+        const existingList = s.proofPhotosList || [];
+        return {
+          ...s,
+          status: markCompleteAfterProof ? 'COMPLETED' : s.status,
+          completedAt: markCompleteAfterProof ? powNow : s.completedAt,
+          completedPomodoroMins: nextCompletedMins,
+          pomodoroSessionsCount:
+            extraMins > 0 ? (s.pomodoroSessionsCount || 0) + 1 : s.pomodoroSessionsCount || 0,
+          savedPomoSecondsLeft: markCompleteAfterProof ? null : s.savedPomoSecondsLeft,
+          savedPomoTotalSeconds: markCompleteAfterProof ? null : s.savedPomoTotalSeconds,
+          savedPomoSelectedMins: markCompleteAfterProof ? null : s.savedPomoSelectedMins,
+          proofPhotoUri: storedUri,
+          proofPhotoCaption: caption,
+          proofPhotosList: [newPhotoItem, ...existingList],
+          proofAnalysis: analysis,
+        };
+      }),
+    }));
+
+    showSternMessage(
+      '📷 ĐÃ LƯU ẢNH BẰNG CHỨNG VÀO TÀNG KINH CÁC!',
+      'Bức ảnh đã được lưu tách rời vào kho lưu trữ và gắn dấu mốc thời gian thực tế.',
+      'seal'
+    );
+  };
+
+  // Global stats across all mountains
+  const globalStats = useMemo(() => {
+    const activeGoals = db.peakGoals.filter((g) => !g.isCompleted);
+    const conqueredGoals = db.peakGoals.filter((g) => g.isCompleted);
+    const mountainStrikes = db.dailyStrikes.filter((s) => s.goalId !== SIDE_QUEST_GOAL_ID);
+    const totalCompletedTodos = mountainStrikes.filter((s) => s.status === 'COMPLETED').length;
+    const totalPomoMins = mountainStrikes.reduce(
+      (sum, s) => sum + (s.completedPomodoroMins || 0),
+      0
+    );
+    return {
+      activeGoalsCount: activeGoals.length,
+      conqueredCount: Math.max(conqueredGoals.length, db.sacredScrolls.length),
+      totalCompletedTodos,
+      totalPomoHours: Number((totalPomoMins / 60).toFixed(1)),
+    };
+  }, [db.peakGoals, db.dailyStrikes, db.sacredScrolls]);
+
+  // Side Quests stats (shift-aware across midnight for NIGHT shift)
+  const sideQuestStats = useMemo(() => {
+    const all = db.dailyStrikes.filter((s) => s.goalId === SIDE_QUEST_GOAL_ID);
+    const today = all.filter((s) => s.date === todayStr);
+    const doneToday = all.filter(
+      (s) =>
+        s.status === 'COMPLETED' &&
+        s.completedAt &&
+        getShiftDateStr(s.completedAt, activeShiftMode, nightShiftStartTime) === todayStr
+    );
+    const pending = all.filter((s) => s.status !== 'COMPLETED');
+    const focusMinsToday = doneToday.reduce((sum, s) => sum + (s.completedPomodoroMins || 0), 0);
+    return { all, today, doneToday, pending, focusMinsToday };
+  }, [db.dailyStrikes, todayStr, activeShiftMode, nightShiftStartTime]);
+
+  const createSideQuest = (title: string, mins: number, startFocusNow: boolean) => {
+    const clean = title.trim();
+    if (!clean) return;
+    const inferredAct =
+      sideQuestActivityType !== 'CHORE'
+        ? sideQuestActivityType
+        : inferTodoActivityType({ goalId: SIDE_QUEST_GOAL_ID, title: clean }, new Map());
+    const created: DailyStrikeTodoEntity = {
+      id: `side-${Date.now()}`,
+      goalId: SIDE_QUEST_GOAL_ID,
+      date: todayStr,
+      title: clean,
+      notes: '',
+      activityType: inferredAct,
+      status: 'PENDING',
+      requiredPomodoroMins: Math.max(5, mins),
+      completedPomodoroMins: 0,
+      pomodoroSessionsCount: 0,
+      requiresPhoto: sideQuestRequiresPhoto,
+      proofPhotoUri: null,
+      proofPhotosList: [],
+      proofAnalysis: null,
+      createdAt: Date.now(),
+    };
+    soundEngine.playWoodenFish(0.6);
+    persistDb((prev) => ({ ...prev, dailyStrikes: [created, ...prev.dailyStrikes] }));
+    if (startFocusNow) {
+      soundEngine.playTempleBell(0.85);
+      enterFocusModeForStrike(created, true);
+    }
+  };
+
+  const handleUpdateSideQuest = useCallback(
+    (
+      strikeId: string,
+      patch: {
+        title: string;
+        notes?: string;
+        activityType: TodoActivityType;
+        requiredPomodoroMins: number;
+        requiresPhoto: boolean;
+      }
+    ) => {
+      const cleanTitle = patch.title.trim();
+      if (!cleanTitle) return;
+      soundEngine.playWoodenFish(0.6);
+      persistDb((prev) => ({
+        ...prev,
+        dailyStrikes: prev.dailyStrikes.map((s) =>
+          s.id === strikeId
+            ? {
+                ...s,
+                title: cleanTitle,
+                notes: patch.notes ?? '',
+                activityType: patch.activityType,
+                requiredPomodoroMins: Math.max(5, Math.min(180, patch.requiredPomodoroMins || 15)),
+                requiresPhoto: patch.requiresPhoto,
+              }
+            : s
+        ),
+      }));
+      showSternMessage('✏️ ĐÃ CẬP NHẬT VIỆC VẶT', `Đã lưu thay đổi cho "${cleanTitle}".`, 'seal');
+    },
+    [persistDb, showSternMessage]
+  );
+
+  const handleCreateStrikeFromSlot = useCallback(
+    (params: {
+      goalId: string;
+      title: string;
+      notes?: string;
+      pomodoroMins: number;
+      scheduledTime?: string;
+      enterFocusNow?: boolean;
+    }) => {
+      const clean = params.title.trim();
+      if (!clean || !params.goalId) return;
+      const goalsMap = new Map(dbRef.current.peakGoals.map((g) => [g.id, g]));
+      const created: DailyStrikeTodoEntity = {
+        id: `strike-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        goalId: params.goalId,
+        date: todayStr,
+        title: clean,
+        notes: params.notes || '',
+        activityType: inferTodoActivityType({ goalId: params.goalId, title: clean }, goalsMap),
+        scheduledTime: params.scheduledTime,
+        status: 'PENDING',
+        requiredPomodoroMins: Math.max(5, Math.min(180, params.pomodoroMins || 25)),
+        completedPomodoroMins: 0,
+        pomodoroSessionsCount: 0,
+        requiresPhoto: true,
+        proofPhotoUri: null,
+        proofPhotosList: [],
+        proofAnalysis: null,
+        createdAt: Date.now(),
+      };
+      soundEngine.playWoodenFish(0.65);
+      persistDb((prev) => ({
+        ...prev,
+        dailyStrikes: [created, ...prev.dailyStrikes],
+      }));
+      if (params.enterFocusNow) {
+        soundEngine.playTempleBell(0.85);
+        enterFocusModeForStrike(created, true);
+      } else {
+        showSternMessage(
+          '⚔️ ĐÃ LÊN CÔNG PHÁ TỪ LỊCH TRÌNH AI!',
+          `Đã thêm "${created.title}" vào danh sách Công Phá hôm nay.`,
+          'seal'
+        );
+      }
+    },
+    [todayStr, persistDb, enterFocusModeForStrike, showSternMessage]
+  );
+
+  // Đợt 2: 1-Click Populate All Today's AI CLIMB Slots Into Daily Strikes
+  const handlePopulateTodayFromSchedule = useCallback(() => {
+    const plan = dbRef.current.climbingSchedulePlan;
+    if (!plan || !Array.isArray(plan.days)) return;
+    const todayDow = getDayOfWeekFromDateStr(todayStr);
+    const dayObj = plan.days.find((d) => d.dayOfWeek === todayDow);
+    if (!dayObj) return;
+
+    const goalsMap = new Map(dbRef.current.peakGoals.map((g) => [g.id, g]));
+    const climbSlots = dayObj.slots.filter((sl) => sl.kind === 'CLIMB' && sl.goalId && goalsMap.has(sl.goalId));
+    if (climbSlots.length === 0) {
+      showSternMessage(
+        'HÔM NAY KHÔNG CÓ KHUNG LEO NÚI NÀO',
+        'Ngày hôm nay trên lịch là ngày nghỉ / tổng kết hoặc chưa có Đỉnh Núi gắn vào.',
+        'info'
+      );
+      return;
+    }
+
+    const existingToday = dbRef.current.dailyStrikes.filter((s) => s.date === todayStr);
+    const toCreate: DailyStrikeTodoEntity[] = [];
+
+    climbSlots.forEach((sl, idx) => {
+      const timeRange = `${sl.startTime}-${sl.endTime}`;
+      const alreadyExists = existingToday.some(
+        (s) => s.goalId === sl.goalId && s.scheduledTime === timeRange
+      );
+      if (alreadyExists) return;
+      const g = goalsMap.get(sl.goalId!);
+      const title = sl.suggestedTask || `Công phá ${g?.title || sl.title}`;
+      toCreate.push({
+        id: `strike-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 5)}`,
+        goalId: sl.goalId!,
+        date: todayStr,
+        title,
+        notes: sl.notes || `Khởi tạo tự động từ Lịch AI (${timeRange})`,
+        activityType: inferTodoActivityType({ goalId: sl.goalId!, title }, goalsMap),
+        scheduledTime: timeRange,
+        status: 'PENDING',
+        requiredPomodoroMins: Math.max(5, Math.min(180, sl.pomodoroMins || 45)),
+        completedPomodoroMins: 0,
+        pomodoroSessionsCount: 0,
+        requiresPhoto: true,
+        proofPhotoUri: null,
+        proofPhotosList: [],
+        proofAnalysis: null,
+        createdAt: Date.now() + idx,
+      });
+    });
+
+    if (toCreate.length === 0) {
+      soundEngine.playWoodenFish(0.6);
+      showSternMessage(
+        '✓ TOÀN BỘ LỊCH HÔM NAY ĐÃ CÓ TODO',
+        'Mọi khung giờ leo núi hôm nay đều đã được tạo Todo Công Phá rồi!',
+        'info'
+      );
+      return;
+    }
+
+    soundEngine.playWoodblockStampSound();
+    persistDb((prev) => ({
+      ...prev,
+      dailyStrikes: [...toCreate.reverse(), ...prev.dailyStrikes],
+    }));
+    showSternMessage(
+      `⚡ ĐÃ ĐỔ ${toCreate.length} TODO CÔNG PHÁ CHO HÔM NAY!`,
+      'Tất cả các khung leo núi hôm nay đã sẵn sàng trong các Đỉnh Núi & Bảng Việc Cần Làm.',
+      'seal'
+    );
+  }, [todayStr, persistDb, showSternMessage]);
+
+  // Đợt 2: Save / Load / Delete Shift Schedule Profiles
+  const handleSaveScheduleProfile = useCallback(
+    (name: string) => {
+      const plan = dbRef.current.climbingSchedulePlan;
+      if (!plan) return;
+      const cleanName = name.trim() || 'Mẫu lịch tuần';
+      const profile: SavedScheduleProfile = {
+        id: `sprof-${Date.now()}`,
+        name: cleanName,
+        savedAt: Date.now(),
+        shiftMode: plan.shiftMode,
+        dayShiftStartTime: plan.dayWorkStartTime || dayShiftStartTime,
+        nightShiftStartTime: plan.nightWorkStartTime || nightShiftStartTime,
+        plan: JSON.parse(JSON.stringify(plan)),
+      };
+      soundEngine.playWoodblockStampSound();
+      persistDb((prev) => ({
+        ...prev,
+        savedScheduleProfiles: [profile, ...(prev.savedScheduleProfiles || [])],
+      }));
+      showSternMessage(
+        '📂 ĐÃ LƯU MẪU LỊCH THEO CA!',
+        `Đã lưu mẫu "${cleanName}". Từ nay bạn có thể đổi sang lịch này chỉ với 1 click.`,
+        'seal'
+      );
+    },
+    [dayShiftStartTime, nightShiftStartTime, persistDb, showSternMessage]
+  );
+
+  const handleLoadScheduleProfile = useCallback(
+    (profileId: string) => {
+      const found = (dbRef.current.savedScheduleProfiles || []).find((p) => p.id === profileId);
+      if (!found) return;
+      soundEngine.playTempleBell(0.9);
+      const parsedNight = parseShiftStartHM(found.nightShiftStartTime, 19);
+      persistDb((prev) => ({
+        ...prev,
+        climbingSchedulePlan: JSON.parse(JSON.stringify(found.plan)),
+        session: {
+          ...prev.session,
+          lawConfig: {
+            ...getLawConfig(prev),
+            workShiftMode: found.shiftMode,
+            dayShiftStartTime: found.dayShiftStartTime,
+            nightShiftStartTime: found.nightShiftStartTime,
+            nightShiftStartHour: parsedNight.hour,
+          },
+        },
+      }));
+      showSternMessage(
+        `📂 ĐÃ ÁP DỤNG MẪU: "${found.name}"`,
+        `Đã chuyển sang Lịch Tuần + Ca ${
+          found.shiftMode === 'NIGHT'
+            ? `Đêm (${found.nightShiftStartTime})`
+            : `Ngày (${found.dayShiftStartTime})`
+        } & đồng bộ Luật Núi!`,
+        'seal'
+      );
+    },
+    [persistDb, showSternMessage]
+  );
+
+  const handleDeleteScheduleProfile = useCallback(
+    (profileId: string) => {
+      soundEngine.playWoodenFish(0.5);
+      persistDb((prev) => ({
+        ...prev,
+        savedScheduleProfiles: (prev.savedScheduleProfiles || []).filter((p) => p.id !== profileId),
+      }));
+    },
+    [persistDb]
+  );
+
+  // Smart Time Audit Manual Logging & Config Handlers
+  const handleAddManualTimeLog = useCallback(
+    (params: {
+      date: string;
+      activityType: TodoActivityType;
+      title: string;
+      durationMins: number;
+    }) => {
+      const cleanTitle = params.title.trim();
+      if (!cleanTitle) return;
+      const mins = Math.max(1, Math.min(1440, Math.round(params.durationMins || 30)));
+      const now = Date.now();
+      const entry: FocusSessionLogEntity = {
+        id: `mlog-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        date: params.date || todayStr,
+        startedAt: now - mins * 60000,
+        endedAt: now,
+        durationMins: mins,
+        activityType: params.activityType,
+        title: cleanTitle,
+        source: 'MANUAL_LOG',
+      };
+      soundEngine.playWoodblockStampSound();
+      persistDb((prev) => ({
+        ...prev,
+        focusSessionLogs: [entry, ...(prev.focusSessionLogs || [])],
+      }));
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      const durText = h > 0 ? `${h}h ${m}p (${mins} phút)` : `${mins} phút`;
+      showSternMessage(
+        '⏱️ ĐÃ GHI SỔ QUỸ THỜI GIAN',
+        `Đã cộng +${durText} "${cleanTitle}" vào ngày ${entry.date}.`,
+        'seal'
+      );
+    },
+    [todayStr, persistDb, showSternMessage]
+  );
+
+  const handleDeleteTimeLog = useCallback(
+    (logId: string) => {
+      soundEngine.playWoodenFish(0.5);
+      persistDb((prev) => ({
+        ...prev,
+        focusSessionLogs: (prev.focusSessionLogs || []).filter((l) => l.id !== logId),
+      }));
+    },
+    [persistDb]
+  );
+
+  const handleUpdateTimeAuditConfig = useCallback(
+    (patch: Partial<TimeAuditConfig>) => {
+      persistDb((prev) => ({
+        ...prev,
+        session: {
+          ...prev.session,
+          timeAuditConfig: {
+            ...(prev.session.timeAuditConfig || {}),
+            ...patch,
+          },
+        },
+      }));
+    },
+    [persistDb]
+  );
+
+  const handleConfirmWorkShift = useCallback(
+    (record: DailyWorkShiftRecord) => {
+      soundEngine.playWoodblockStampSound();
+      persistDb((prev) => ({
+        ...prev,
+        dailyWorkShiftLogs: {
+          ...(prev.dailyWorkShiftLogs || {}),
+          [record.date]: record,
+        },
+      }));
+      const h = Math.floor(record.workDurationMins / 60);
+      const m = record.workDurationMins % 60;
+      const durText = record.isDayOffNoWork
+        ? '0h (Hôm nay nghỉ làm)'
+        : `${h > 0 ? `${h}h ` : ''}${m}p (${record.workStartTime}${
+            record.workEndTime ? ` → ${record.workEndTime}` : ''
+          })`;
+      showSternMessage(
+        '🏠 ĐÃ CHỐT GIỜ ĐI LÀM & TÍNH QUỸ RẢNH',
+        `Ngày ${record.date}: Đã ghi nhận thời gian đi làm ${durText}. Hệ thống đã tự động cập nhật realtime Quỹ Thời Gian Rảnh 24h.`,
+        'seal'
+      );
+    },
+    [persistDb, showSternMessage]
+  );
+
+  const handleClearWorkShift = useCallback(
+    (dateStr: string) => {
+      soundEngine.playWoodenFish(0.5);
+      persistDb((prev) => {
+        const next = { ...(prev.dailyWorkShiftLogs || {}) };
+        delete next[dateStr];
+        return {
+          ...prev,
+          dailyWorkShiftLogs: next,
+        };
+      });
+    },
+    [persistDb]
+  );
+
+  const pinnedOptimizationNotes = useMemo(() => {
+    const all = db.optimizationNotes || [];
+    return [...all].sort((a, b) => {
+      if (Boolean(a.isPinned) !== Boolean(b.isPinned)) return a.isPinned ? -1 : 1;
+      return (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt);
+    });
+  }, [db.optimizationNotes]);
+
+  const handleSaveQuickOptimizationNote = useCallback(
+    (params: {
+      title: string;
+      content: string;
+      category: OptimizationCategory;
+      timeSavedHint?: string;
+    }) => {
+      const now = Date.now();
+      const created: OptimizationNoteEntity = {
+        id: `opt-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        title: params.title,
+        content: params.content,
+        category: params.category,
+        goalId:
+          focusedStrike && focusedStrike.goalId !== SIDE_QUEST_GOAL_ID
+            ? focusedStrike.goalId
+            : undefined,
+        timeSavedHint: params.timeSavedHint,
+        isPinned: true,
+        appliedCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      soundEngine.playWoodblockStampSound();
+      persistDb((prev) => ({
+        ...prev,
+        optimizationNotes: [created, ...(prev.optimizationNotes || [])],
+      }));
+      showSternMessage(
+        '💡 ĐÃ LƯU Ý TƯỞNG VÀO SỔ BÍ KÍP!',
+        `Đã lưu "${created.title}" vào Sổ Bí Kíp Tối Ưu.`,
+        'seal'
+      );
+    },
+    [focusedStrike, persistDb, showSternMessage]
+  );
+
+  const handleApplyOptimizationNote = useCallback(
+    (note: OptimizationNoteEntity) => {
+      soundEngine.playWoodenFish(0.75);
+      const nextCount = (note.appliedCount || 0) + 1;
+      persistDb((prev) => ({
+        ...prev,
+        optimizationNotes: (prev.optimizationNotes || []).map((n) =>
+          n.id === note.id
+            ? { ...n, appliedCount: nextCount, lastAppliedDate: todayStr, updatedAt: Date.now() }
+            : n
+        ),
+      }));
+      showSternMessage(
+        '⚡ ĐÃ ÁP DỤNG BÍ KÍP TỐI ƯU!',
+        `Đã ghi nhận áp dụng "${note.title}" (${nextCount} lần).`,
+        'seal'
+      );
+    },
+    [todayStr, persistDb, showSternMessage]
+  );
+
+  const focusIsSideQuest = focusedStrike?.goalId === SIDE_QUEST_GOAL_ID;
+  const focusContextTitle = focusIsSideQuest
+    ? '🧹 Việc Vặt (Không Goal)'
+    : db.peakGoals.find((g) => g.id === focusedStrike?.goalId)?.title || 'Đỉnh Núi đã xóa';
+
+  const focusedActivityType = useMemo<TodoActivityType>(() => {
+    if (!focusedStrike) return 'DEEP_WORK';
+    return inferTodoActivityType(
+      focusedStrike,
+      new Map(db.peakGoals.map((g) => [g.id, g]))
+    );
+  }, [focusedStrike, db.peakGoals]);
+
+  const liveActiveSession = useMemo<LiveActiveSessionInput | null>(() => {
+    if (!focusedStrike) return null;
+    const elapsedSecs = Math.max(0, pomoTotalSeconds - pomoSecondsLeft);
+    const elapsedMins = elapsedSecs >= 30 ? Math.max(1, Math.round(elapsedSecs / 60)) : 0;
+    if (elapsedMins <= 0) return null;
+    return {
+      strikeId: focusedStrike.id,
+      goalId: focusedStrike.goalId,
+      title: focusedStrike.title,
+      activityType: focusedActivityType,
+      elapsedMins,
+      date: todayStr,
+    };
+  }, [focusedStrike, focusedActivityType, pomoTotalSeconds, pomoSecondsLeft, todayStr]);
+
+  const todayTimeAudit = useMemo(
+    () => computeDayTimeAudit(db, todayStr, todayStr, nowTick, liveActiveSession),
+    [db, todayStr, nowTick, liveActiveSession]
+  );
 
   return (
-    <div
-      className={`monk-app-shell ${
-        db.session.isMonkModeOn ? 'monk-mode-active' : 'monk-mode-off'
-      }`}
-    >
-      {/* Custom Shanshui Mist & Ink-Wash Canvas Shader Background */}
+    <div className={`monk-app-shell ${focusedStrike ? 'fullscreen-todo-mode' : ''}`}>
       <ShanshuiCanvasBg
-        isMonkModeOn={db.session.isMonkModeOn}
-        isLockScreenView={isLockScreenOverlay}
+        isMonkModeOn={false}
+        isLockScreenView={false}
+        reduceMotion={Boolean(db.session.reduceMotion)}
       />
 
-      {/* Relentless Nagging Engine Overlay */}
-      <RelentlessAlarmOverlay
-        alert={naggingAlert}
-        onDismissLevel1={() => setNaggingAlert(null)}
-        onEscalateToLevel2={() => {
-          if (naggingAlert) {
-            setNaggingAlert({ ...naggingAlert, level: 2 });
-          }
-        }}
-        onStartPomodoroNow={(alert) => {
-          setNaggingAlert(null);
-          if (alert.targetType === 'RITUAL') {
-            const r = db.ritualHabits.find((x) => x.id === alert.targetId);
-            if (r) {
-              setActivePomodoro({
-                type: 'RITUAL',
-                id: r.id,
-                title: r.title,
-                requiredMins: r.requiredPomodoroMins,
-                requiresPhoto: r.requiresPhoto,
-              });
-            }
-          } else {
-            const s = db.dailyStrikes.find((x) => x.id === alert.targetId);
-            if (s) {
-              setActivePomodoro({
-                type: 'STRIKE',
-                id: s.id,
-                title: s.title,
-                requiredMins: s.requiredPomodoroMins,
-                requiresPhoto: true,
-              });
-            }
-          }
-        }}
-      />
-
-      {/* Full-Screen Shanshui Lock Screen Overlay */}
-      {isLockScreenOverlay && (
-        <div className="shanshui-lockscreen-overlay">
-          <div className="lockscreen-content-box">
-            <div className="lockscreen-badge">
-              MÀN HÌNH KHÓA TU LUYỆN — CHỐN THÂM SƠN CÙNG CỐC
-            </div>
-            <h1 className="lockscreen-motto">“{db.session.mottoText}”</h1>
-
-            <div className="lockscreen-countdown-box">
-              <span className="lockscreen-label">ĐỒNG HỒ ĐẾM NGƯỢC XUỐNG NÚI</span>
-              <div className="lockscreen-digits">{countdownInfo.text}</div>
-              <div className="lockscreen-sub">
-                Chuỗi ngày kỷ luật: <strong>{db.session.currentStreak} ngày</strong> | Số lần phạm
-                giới: <strong>{db.session.violationCount} lần</strong>
-              </div>
-            </div>
-
-            <div className="lockscreen-progress-section">
-              <div className="lockscreen-progress-header">
-                <span>TIẾN ĐỘ ĐỈNH NÚI: {currentPeakGoal.title}</span>
-                <strong>{overallProgressPct}% / 100%</strong>
-              </div>
-              <div className="zen-progress-track track-large">
-                <div
-                  className="zen-progress-fill"
-                  style={{ width: `${overallProgressPct}%` }}
-                />
-              </div>
-            </div>
-
-            <div style={{ marginTop: 28 }}>
-              <button
-                type="button"
-                className="zen-btn zen-btn-seal btn-large-ceremony"
-                onClick={() => {
-                  soundEngine.playTempleBell(0.75);
-                  setIsLockScreenOverlay(false);
-                }}
-              >
-                <Mountain size={18} />
-                <span>Bước Vào Chánh Điện Tu Luyện (Mở Màn Hình Chính)</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Stern Ascetic Notification Banner */}
+      {/* Stern Toast Banner */}
       {sternToast && (
         <div className={`stern-toast-banner toast-${sternToast.type}`}>
           <div className="stern-toast-content">
@@ -910,1649 +2405,1019 @@ export const App: React.FC = () => {
               <p>{sternToast.message}</p>
             </div>
           </div>
-          <button
-            type="button"
-            className="stern-toast-close"
-            onClick={() => setSternToast(null)}
-          >
+          <button type="button" className="stern-toast-close" onClick={() => setSternToast(null)}>
             Đã rõ
           </button>
         </div>
       )}
 
-      {/* TOP HERO COMMAND BAR */}
-      <header className="monk-top-header">
-        <div className="brand-identity">
-          <div className="brand-seal-icon">山</div>
-          <div>
-            <div className="brand-subtitle">HỆ THỐNG KỶ LUẬT CỰC ĐOAN — SHANSHUI ZEN DESKTOP</div>
-            <h1 className="brand-title">LÊN NÚI (ASCEND THE MOUNTAIN)</h1>
-            <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-              <button
-                type="button"
-                className="zen-btn zen-btn-seal"
-                style={{ padding: '5px 11px', fontSize: 12 }}
-                onClick={() => {
-                  soundEngine.playWoodenFish(0.6);
-                  if (db.sacredScrolls.length > 0) {
-                    setViewingScroll(db.sacredScrolls[0]);
-                  } else {
-                    setActiveTab('TANG_KINH_CAC');
-                  }
-                }}
-              >
-                <ScrollText size={14} />
-                <span>MỞ TÀNG KINH CÁC ({db.sacredScrolls.length} BÍ KÍP)</span>
-              </button>
-              <button
-                type="button"
-                className="zen-btn zen-btn-outline"
-                style={{ padding: '5px 10px', fontSize: 12 }}
-                onClick={() => setIsLockScreenOverlay(true)}
-              >
-                <Eye size={13} />
-                <span>Màn Hình Khóa</span>
-              </button>
+      {/* Offline Catch-Up Banner */}
+      {db.session.pendingOfflineReport && !focusedStrike && (
+        <div
+          className={`offline-catchup-banner ${
+            db.session.pendingOfflineReport.missedDeadlineWhileOffline ||
+            db.session.pendingOfflineReport.missedDates.length > 0
+              ? 'is-violation'
+              : 'is-info'
+          }`}
+        >
+          <div className="offline-catchup-body">
+            <Cpu size={22} />
+            <div>
+              <strong>
+                {db.session.pendingOfflineReport.missedDeadlineWhileOffline
+                  ? '⏰ PHÁT HIỆN TẮT MÁY TRƯỚC GIỜ CHỐT SỔ — ĐÃ TỰ ĐỘNG XÉT DUYỆT BÙ!'
+                  : '🛡️ BÁO CÁO ĐỐI SOÁT THỜI GIAN CHẠY NỀN'}
+              </strong>
+              <p>{db.session.pendingOfflineReport.summary}</p>
             </div>
           </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
+              type="button"
+              className="zen-btn zen-btn-outline"
+              onClick={() => setViolationModalOpen(true)}
+            >
+              Xem Sổ Án
+            </button>
+            <button
+              type="button"
+              className="stern-toast-close"
+              onClick={() =>
+                persistDb((prev) => ({
+                  ...prev,
+                  session: { ...prev.session, pendingOfflineReport: null },
+                }))
+              }
+            >
+              Đã hiểu & Xác nhận
+            </button>
+          </div>
         </div>
+      )}
 
-        {/* 3 Core Direct Display Metrics (Section 4) */}
-        <div className="hero-core-metrics">
-          {/* (1) Câu tâm niệm tu luyện */}
-          <div className="hero-metric-card motto-card">
-            <div className="metric-card-header">
-              <span>(1) TÂM NIỆM TU LUYỆN</span>
-              {!db.session.isMonkModeOn && (
+      {/* TOP COMMAND HEADER */}
+      {!focusedStrike && (
+        <header className="monk-top-header v3-top-header">
+          <div
+            className="brand-identity"
+            style={{ cursor: 'pointer' }}
+            onClick={() => {
+              setSelectedGoalId(null);
+              setFocusedStrikeId(null);
+              setOuterTab('GOALS_LIST');
+            }}
+          >
+            <div className="brand-seal-icon">山</div>
+            <div>
+              <div className="brand-subtitle">HỆ THỐNG PHÁT TRIỂN BẢN THÂN & KỶ LUẬT THÉP</div>
+              <h1 className="brand-title">LÊN NÚI (ASCEND THE MOUNTAIN)</h1>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: 8,
+                  marginTop: 8,
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                }}
+              >
+                <span className="time-window-pill">
+                  ⛰️ {db.peakGoals.length} Đỉnh Núi &bull; ⚔️ {globalStats.totalCompletedTodos}{' '}
+                  Todo đã xong ({globalStats.totalPomoHours}h Pomodoro)
+                </span>
+                <span
+                  className={`daemon-live-pill ${daemonStatus?.ok ? 'online' : 'offline'}`}
+                  title={
+                    daemonStatus?.ok
+                      ? `Trình chạy nền đang bảo vệ kỷ luật (PID ${daemonStatus.pid || '-'})`
+                      : 'Đang mở dạng trình duyệt tĩnh (khuyên chạy qua script để kích hoạt chạy nền 24/7)'
+                  }
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedGoalId(null);
+                    setFocusedStrikeId(null);
+                    setOuterTab('SETTINGS');
+                  }}
+                >
+                  <Cpu size={12} />
+                  <span>{daemonStatus?.ok ? 'Chạy nền 24/7: BẬT' : 'Chưa bật trình nền'}</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="hero-vow-banner">
+            <div className="hero-vow-top-row">
+              <div className="hero-vow-tag">
+                <Sparkles size={14} color="#f0c878" />
+                <span>TÂM NIỆM SỐNG — KHÔNG ĐỂ MỘT GIÂY PHÚT NÀO LÃNG PHÍ</span>
+              </div>
+
+              <div className="hero-datetime-box">
+                <div className="hero-calendar-date">
+                  <Calendar size={15} color="#7DBFA8" />
+                  <span>
+                    Hôm nay: <strong style={{ color: '#F6F4EE' }}>{displayDateVn}</strong>
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  className={`shift-mode-pill ${
+                    activeShiftMode === 'NIGHT' ? 'night-shift' : 'day-shift'
+                  }`}
+                  onClick={() =>
+                    handleSwitchWorkShift(activeShiftMode === 'NIGHT' ? 'DAY' : 'NIGHT')
+                  }
+                  title={`Đang áp dụng: ${
+                    activeShiftMode === 'NIGHT'
+                      ? `Ca Đêm (vào ca ${nightShiftStartTime} – chốt ${nightShiftStartTime} hôm sau)`
+                      : `Ca Ngày (vào ca ${dayShiftStartTime} – chốt 23:59)`
+                  }. Bấm để chuyển đổi ca.`}
+                >
+                  {activeShiftMode === 'NIGHT' ? (
+                    <>
+                      <Moon size={13} color="#f0c878" />
+                      <span>Ca Đêm (vào {nightShiftStartTime})</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sun size={13} color="#ffb74d" />
+                      <span>Ca Ngày (vào {dayShiftStartTime})</span>
+                    </>
+                  )}
+                </button>
+
+                <span className="hero-deadline-hint">
+                  Hạn chót: <strong>{timeLeftToday.deadlineTitle}</strong> (còn {timeLeftToday.label})
+                </span>
+
+                <button
+                  type="button"
+                  className={`header-audit-pill ${
+                    todayTimeAudit.verdictLevel === 'AWAITING_WORK_LOG'
+                      ? 'is-awaiting'
+                      : todayTimeAudit.wastedMins >= 150
+                      ? 'has-waste'
+                      : 'is-clean'
+                  }`}
+                  onClick={() => {
+                    setSelectedGoalId(null);
+                    setFocusedStrikeId(null);
+                    setOuterTab('TIME_AUDIT');
+                  }}
+                  title="Bấm để mở Bảng Kiểm Toán Quỹ Thời Gian & Chốt Giờ Đi Làm Về"
+                >
+                  <PieChart size={13} />
+                  {todayTimeAudit.verdictLevel === 'AWAITING_WORK_LOG' ? (
+                    <span>🏠 Chờ xác nhận đã đi làm về</span>
+                  ) : (
+                    <span>
+                      Hiệu suất: <strong>{todayTimeAudit.utilizationPct}%</strong> &bull; Lãng phí:{' '}
+                      <strong>{todayTimeAudit.wastedMins}p</strong>
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  className="header-cmd-pill"
+                  onClick={() => setCommandPaletteOpen(true)}
+                  title="Mở bảng tìm kiếm nhanh toàn app (Ctrl+K)"
+                >
+                  <Search size={12} />
+                  <span>Tìm nhanh (Ctrl+K)</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="hero-vow-body-row">
+              <div className="motto-quote-display-large">
+                “{selectedGoal?.futureSelfVow || db.session.mottoText}”
+              </div>
+
+              <div
+                className="hero-streak-badge"
+                title={`Chuỗi kỷ luật: Bạn đã kiên trì ${db.session.currentStreak} ngày liên tục không vi phạm luật núi! Bấm để xem Sổ Luật.`}
+                onClick={() => {
+                  setSelectedGoalId(null);
+                  setFocusedStrikeId(null);
+                  setOuterTab('LAWS');
+                }}
+              >
+                <div className="hero-streak-icon-wrap">
+                  <Flame size={28} color="#ff9800" className="streak-flame-anim" />
+                </div>
+                <div className="hero-streak-text-wrap">
+                  <div className="hero-streak-number">
+                    {db.session.currentStreak} <span className="hero-streak-unit">NGÀY</span>
+                  </div>
+                  <div className="hero-streak-label">CHUỖI KỶ LUẬT</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div
+            className={`violation-critical-card ${
+              db.session.violationCount > 0 ? 'has-violations' : 'zero-violations'
+            }`}
+            onClick={() => setViolationModalOpen(true)}
+            title="Bấm để xem Sổ Án Vi Phạm & Cơ chế Hệ thống tự động xét Luật Núi"
+          >
+            <div className="violation-card-top">
+              <div className="violation-title-badge">
+                {db.session.violationCount > 0 ? (
+                  <>
+                    <ShieldAlert size={18} />
+                    <span>CẢNH BÁO VI PHẠM LUẬT NÚI</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck size={18} color="#7DBFA8" />
+                    <span>TRẠNG THÁI KỶ LUẬT LUẬT NÚI</span>
+                  </>
+                )}
+              </div>
+              <span className="violation-count-pill">
+                {db.session.violationCount > 0
+                  ? `${db.session.violationCount} LẦN VI PHẠM`
+                  : '0 VI PHẠM'}
+              </span>
+            </div>
+
+            <div className="violation-card-body">
+              {db.session.violationCount > 0 ? (
+                <p className="violation-warning-text">
+                  ⚠️ <strong>NGHIÊM TRỌNG:</strong> Hệ thống đã ghi nhận{' '}
+                  <strong>{db.session.violationCount} lần vi phạm Luật Núi</strong>! Mỗi lần bỏ dở
+                  Todo hoặc Nghi thức trong ngày là một vết sẹo kéo lùi ngày chạm đỉnh.
+                </p>
+              ) : todayLawPreview.length > 0 ? (
+                <p className="violation-warning-text">
+                  ⏳ <strong>CHƯA CÓ VI PHẠM:</strong> Hôm nay còn{' '}
+                  <strong>{todayLawPreview.length} nghĩa vụ</strong> cần hoàn thành trước{' '}
+                  {timeLeftToday.deadlineTitle} (còn {timeLeftToday.label}).
+                </p>
+              ) : (
+                <p className="violation-warning-text">
+                  ✅ <strong>KỶ LUẬT NGHIÊM MINH:</strong> Chưa có lỗi vi phạm nào. Hệ thống tự động
+                  xét duyệt Todo & Nghi thức (ngưỡng ≥{lawConfig.ritualPassThresholdPct ?? 70}%) vào{' '}
+                  {timeLeftToday.deadlineTitle}.
+                </p>
+              )}
+            </div>
+
+            <div className="violation-card-footer">
+              <span>
+                {db.violations[0]
+                  ? `Gần nhất (${db.violations[0].date}): ${db.violations[0].reason.slice(0, 42)}...`
+                  : 'Hệ thống tự động tính xét theo Bộ Luật Núi'}
+              </span>
+              <span className="violation-action-link">Xem Luật & Sổ Án &rarr;</span>
+            </div>
+          </div>
+        </header>
+      )}
+
+      {/* NAVIGATION BAR */}
+      {!focusedStrike &&
+        (!selectedGoal ? (
+          <nav className="monk-module-nav outer-nine-tabs-nav">
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'GOALS_LIST' ? 'active' : ''}`}
+              onClick={() => setOuterTab('GOALS_LIST')}
+            >
+              <Mountain size={20} />
+              <div>
+                <div className="tab-main-name">1. Các Đỉnh Núi</div>
+                <div className="tab-sub-role">{db.peakGoals.length} mục tiêu đang theo dõi</div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'AI_SCHEDULE' ? 'active' : ''}`}
+              onClick={() => setOuterTab('AI_SCHEDULE')}
+            >
+              <Bot size={20} />
+              <div>
+                <div className="tab-main-name">2. Lịch Trình AI</div>
+                <div className="tab-sub-role">
+                  {db.climbingSchedulePlan
+                    ? db.climbingSchedulePlan.shiftMode === 'NIGHT'
+                      ? 'Ca Đêm • Lịch 7 ngày'
+                      : 'Ca Ngày • Lịch 7 ngày'
+                    : 'Xếp khung giờ cân bằng'}
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'TIME_AUDIT' ? 'active' : ''}`}
+              onClick={() => setOuterTab('TIME_AUDIT')}
+            >
+              <PieChart size={20} />
+              <div>
+                <div className="tab-main-name">3. Quỹ Thời Gian</div>
+                <div className="tab-sub-role">
+                  {todayTimeAudit.verdictLevel === 'AWAITING_WORK_LOG'
+                    ? 'Chờ bấm "Đã đi làm về" • Tính quỹ rảnh 24h'
+                    : `Tận dụng ${todayTimeAudit.utilizationPct}% • Điểm ${todayTimeAudit.realEffortScore}/100`}
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'OPTIMIZATION_VAULT' ? 'active' : ''}`}
+              onClick={() => setOuterTab('OPTIMIZATION_VAULT')}
+            >
+              <Lightbulb size={20} />
+              <div>
+                <div className="tab-main-name">4. Bí Kíp &amp; Ý Tưởng</div>
+                <div className="tab-sub-role">
+                  {(db.optimizationNotes || []).length} mẹo tối ưu hóa
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'SIDE_QUESTS' ? 'active' : ''}`}
+              onClick={() => setOuterTab('SIDE_QUESTS')}
+            >
+              <Sparkles size={20} />
+              <div>
+                <div className="tab-main-name">5. Việc Vặt</div>
+                <div className="tab-sub-role">Còn {sideQuestStats.pending.length} việc chờ</div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'RITUALS' ? 'active' : ''}`}
+              onClick={() => setOuterTab('RITUALS')}
+            >
+              <Flame size={20} />
+              <div>
+                <div className="tab-main-name">6. Nghi Thức</div>
+                <div className="tab-sub-role">
+                  {ritualStatsToday.completedItems}/{ritualStatsToday.totalItems} bước (
+                  {ritualStatsToday.pct}%)
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'LAWS' ? 'active' : ''}`}
+              onClick={() => setOuterTab('LAWS')}
+            >
+              <Scale size={20} />
+              <div>
+                <div className="tab-main-name">7. Luật Núi</div>
+                <div className="tab-sub-role">
+                  {activeShiftMode === 'NIGHT' ? `Tự xét ${nightShiftStartTime}` : 'Tự xét 23:59'}
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab tab-tang-kinh-cac ${
+                outerTab === 'TANG_KINH_CAC' ? 'active' : ''
+              }`}
+              onClick={() => setOuterTab('TANG_KINH_CAC')}
+            >
+              <ScrollText size={20} />
+              <div>
+                <div className="tab-main-name">8. Tàng Kinh Các</div>
+                <div className="tab-sub-role">{db.sacredScrolls.length} núi đã chinh phục</div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              className={`module-nav-tab ${outerTab === 'SETTINGS' ? 'active' : ''}`}
+              onClick={() => {
+                setConfirmResetMode('NONE');
+                setOuterTab('SETTINGS');
+              }}
+            >
+              <Settings size={20} />
+              <div>
+                <div className="tab-main-name">9. Cài Đặt &amp; Nền</div>
+                <div className="tab-sub-role">Chạy nền, Auto-Start &amp; Data</div>
+              </div>
+            </button>
+          </nav>
+        ) : (
+          <div className="inner-mountain-nav-wrapper">
+            <div className="inner-mountain-context-bar">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                 <button
                   type="button"
                   className="zen-btn zen-btn-outline"
-                  style={{ padding: '2px 8px', fontSize: 11 }}
                   onClick={() => {
-                    setMottoDraft(db.session.mottoText);
-                    setInitialDaysDraft(db.session.initialDays);
-                    setGoalTitleDraft(currentPeakGoal.title);
-                    setGoalDescDraft(currentPeakGoal.description);
-                    setGoalTargetDraft(currentPeakGoal.targetMetric);
-                    setGoalUnitDraft(currentPeakGoal.unit);
-                    setEditingPeakGoal(true);
+                    setFocusedStrikeId(null);
+                    setSelectedGoalId(null);
+                    setOuterTab('GOALS_LIST');
                   }}
                 >
-                  <Edit3 size={11} /> Sửa Đỉnh Núi / Tâm Niệm
+                  <ArrowLeft size={15} />
+                  <span>Quay Lại Danh Sách Các Đỉnh Núi</span>
                 </button>
-              )}
+
+                <div className="inner-mountain-title-pill">
+                  <span className="zen-tag-red">ĐANG Ở TRÊN ĐỈNH NÚI</span>
+                  <strong>⛰️ {selectedGoal.title}</strong>
+                  <span className="pomo-pill">Tiến độ: {selectedGoal.progressPct}%</span>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                {db.peakGoals.length > 1 && (
+                  <select
+                    className="zen-input"
+                    style={{ padding: '6px 10px', fontSize: 12.5 }}
+                    value={selectedGoal.id}
+                    onChange={(e) => {
+                      setFocusedStrikeId(null);
+                      setSelectedGoalId(e.target.value);
+                    }}
+                  >
+                    {db.peakGoals.map((g, idx) => (
+                      <option key={g.id} value={g.id}>
+                        Chuyển nhanh: Núi #{idx + 1} — {g.title.slice(0, 38)} ({g.progressPct}%)
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                <button
+                  type="button"
+                  className="zen-btn zen-btn-outline"
+                  style={{ padding: '6px 11px', fontSize: 12.5 }}
+                  onClick={() => {
+                    setFocusedStrikeId(null);
+                    setSelectedGoalId(null);
+                    setOuterTab('LAWS');
+                  }}
+                >
+                  <Scale size={14} />
+                  <span>Đọc Luật Núi</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="zen-btn zen-btn-outline"
+                  style={{ padding: '6px 11px', fontSize: 12.5 }}
+                  onClick={() => handleOpenEditGoalModal(selectedGoal)}
+                >
+                  <Edit3 size={14} />
+                  <span>Sửa Ngọn Núi & Checklist</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="zen-btn zen-btn-seal"
+                  style={{ padding: '6px 13px', fontSize: 12.5 }}
+                  onClick={() => handleLaunchConquerMountainCeremony(selectedGoal)}
+                >
+                  <Award size={15} />
+                  <span>Đóng Dấu Chinh Phục Đỉnh Núi (Lưu Tàng Kinh Các)</span>
+                </button>
+              </div>
             </div>
-            <div className="motto-quote-display">“{db.session.mottoText}”</div>
-          </div>
 
-          {/* (2) Đồng hồ đếm ngược ngày/giờ xuống núi */}
-          <div className="hero-metric-card countdown-card">
-            <div className="metric-card-header">
-              <span>(2) ĐẾM NGƯỢC XUỐNG NÚI</span>
-              <span className="streak-pill">
-                <Flame size={13} /> Streak: {db.session.currentStreak} ngày
-              </span>
-            </div>
-            <div className="countdown-digits">{countdownInfo.text}</div>
-            <div className="countdown-sub">
-              Cam kết: {db.session.initialDays} ngày | Vi phạm Luật Núi: {db.session.violationCount}{' '}
-              lần
-            </div>
-          </div>
+            <nav className="monk-module-nav inner-four-tabs-nav">
+              <button
+                type="button"
+                className={`module-nav-tab ${innerTab === 'DAILY_STRIKES' ? 'active' : ''}`}
+                onClick={() => setInnerTab('DAILY_STRIKES')}
+              >
+                <Swords size={18} />
+                <div>
+                  <div className="tab-main-name">1. Công Phá (Todo & Focus Pomodoro)</div>
+                  <div className="tab-sub-role">
+                    Ấn vào từng Todo để vào màn hình tập trung toàn màn hình
+                  </div>
+                </div>
+              </button>
 
-          {/* (3) Thanh tiến độ hoàn thành mục tiêu (%) */}
-          <div className="hero-metric-card progress-card">
-            <div className="metric-card-header">
-              <span>(3) TIẾN ĐỘ ĐỈNH NÚI DUY NHẤT</span>
-              <strong style={{ color: overallProgressPct >= 100 ? '#4CAF50' : '#f3a6a7' }}>
-                {overallProgressPct}% / 100%
-              </strong>
-            </div>
-            <div className="zen-progress-track">
-              <div
-                className="zen-progress-fill"
-                style={{ width: `${overallProgressPct}%` }}
-              />
-            </div>
-            <div className="countdown-sub">
-              {isOvertimeLockActive ? (
-                <span style={{ color: '#EF5350', fontWeight: 700 }}>
-                  CƯỠNG BỨC QUÁ GIỜ (OVERTIME LOCK): Còn thiếu {100 - overallProgressPct}%!
-                </span>
-              ) : (
-                <span>
-                  Khóa Kép: {isTimeCommitmentReached ? 'Đủ giờ' : 'Chưa đủ giờ'} &bull;{' '}
-                  {allGoals100Pct ? 'Đạt 100% KPI' : `Đạt ${overallProgressPct}% KPI`}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
+              <button
+                type="button"
+                className={`module-nav-tab ${innerTab === 'REFLECTION' ? 'active' : ''}`}
+                onClick={() => {
+                  setFocusedStrikeId(null);
+                  setInnerTab('REFLECTION');
+                }}
+              >
+                <FileText size={18} />
+                <div>
+                  <div className="tab-main-name">2. Tự Vấn (Nhật Ký Đỉnh Núi)</div>
+                  <div className="tab-sub-role">
+                    Ghi chép bài học & tự vấn gắn riêng với ngọn núi này
+                  </div>
+                </div>
+              </button>
 
-        {/* MONK MODE MASTER SWITCH */}
-        <div className="monk-switch-panel">
-          <div className="monk-state-indicator">
-            <span className={`status-dot ${db.session.isMonkModeOn ? 'dot-on' : 'dot-off'}`} />
-            <span>
-              {db.session.isMonkModeOn
-                ? 'MONK MODE: ON (TRÊN ĐỈNH NÚI)'
-                : 'MONK MODE: OFF (DƯỚI CHÂN NÚI)'}
-            </span>
-          </div>
+              <button
+                type="button"
+                className={`module-nav-tab ${innerTab === 'MOUNTAIN_HISTORY' ? 'active' : ''}`}
+                onClick={() => {
+                  setFocusedStrikeId(null);
+                  setInnerTab('MOUNTAIN_HISTORY');
+                }}
+              >
+                <History size={18} />
+                <div>
+                  <div className="tab-main-name">3. Hành Trình & Bằng Chứng PoW</div>
+                  <div className="tab-sub-role">Lịch sử Todo, Checklist & Ảnh bằng chứng</div>
+                </div>
+              </button>
 
-          <button
-            type="button"
-            className={`monk-master-toggle-btn ${
-              db.session.isMonkModeOn
-                ? isDualLockSatisfied
-                  ? 'btn-ready-descend'
-                  : 'btn-locked-on-mountain'
-                : 'btn-ascend-now'
-            }`}
-            onClick={handleToggleMonkMode}
-          >
-            {db.session.isMonkModeOn ? (
-              isDualLockSatisfied ? (
-                <>
-                  <Award size={18} />
-                  <span>ĐẮC ĐẠO XUỐNG NÚI (MỞ KHÓA)</span>
-                </>
-              ) : (
-                <>
-                  <Lock size={17} />
-                  <span>
-                    {isOvertimeLockActive
-                      ? `KHÓA QUÁ GIỜ (THIẾU ${100 - overallProgressPct}%)`
-                      : 'ĐANG KHÓA KÉP (DUAL-LOCK)'}
-                  </span>
-                </>
-              )
-            ) : (
-              <>
-                <Unlock size={17} />
-                <span>GẠT BẬT MONK MODE: LÊN NÚI</span>
-              </>
-            )}
-          </button>
-
-          <div className="header-sub-actions">
-            <span style={{ fontSize: 11, color: '#B8B4A9', fontFamily: 'var(--font-mono)' }}>
-              {db.session.isMonkModeOn
-                ? 'Đang bật: Khóa Pomodoro + Live PoW + 100 từ'
-                : 'Đang tắt: Tích Checkbox tự giác & Viết tự do'}
-            </span>
+              <button
+                type="button"
+                className={`module-nav-tab ${innerTab === 'RITUALS' ? 'active' : ''}`}
+                onClick={() => {
+                  setFocusedStrikeId(null);
+                  setInnerTab('RITUALS');
+                }}
+              >
+                <Flame size={18} />
+                <div>
+                  <div className="tab-main-name">4. Nghi Thức Đầu Buổi (Rituals)</div>
+                  <div className="tab-sub-role">
+                    Kiểm tra nhanh thói quen trước khi ngồi vào bàn học
+                  </div>
+                </div>
+              </button>
+            </nav>
           </div>
-        </div>
-      </header>
-
-      {/* PROMINENT INTERACTIVE MODULE NAVIGATION BAR */}
-      <nav className="monk-module-nav">
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'UNIFIED_4_IN_1' ? 'active' : ''}`}
-          onClick={() => setActiveTab('UNIFIED_4_IN_1')}
-        >
-          <LayoutGrid size={18} />
-          <div>
-            <div className="tab-main-name">Tất Cả 4-Trong-1 & Tàng Kinh Các</div>
-            <div className="tab-sub-role">Toàn cảnh bàn tu luyện</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'PEAK_GOALS' ? 'active' : ''}`}
-          onClick={() => setActiveTab('PEAK_GOALS')}
-        >
-          <Mountain size={18} />
-          <div>
-            <div className="tab-main-name">1. Đỉnh Núi (The Peak)</div>
-            <div className="tab-sub-role">Goal Tracker (1 Goal: {overallProgressPct}%)</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'RITUALS' ? 'active' : ''}`}
-          onClick={() => setActiveTab('RITUALS')}
-        >
-          <Flame size={18} />
-          <div>
-            <div className="tab-main-name">2. Nghi Thức (Rituals)</div>
-            <div className="tab-sub-role">Habit Tracker ({db.ritualHabits.length} thói quen)</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'DAILY_STRIKES' ? 'active' : ''}`}
-          onClick={() => setActiveTab('DAILY_STRIKES')}
-        >
-          <Swords size={18} />
-          <div>
-            <div className="tab-main-name">3. Công Phá (Daily Strikes)</div>
-            <div className="tab-sub-role">Todo List ({db.dailyStrikes.length} nhiệm vụ)</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'REFLECTION' ? 'active' : ''}`}
-          onClick={() => setActiveTab('REFLECTION')}
-        >
-          <FileText size={18} />
-          <div>
-            <div className="tab-main-name">4. Tự Vấn (Reflection)</div>
-            <div className="tab-sub-role">Daily Journal ({db.reflectionJournals.length} đêm)</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab tab-tang-kinh-cac ${
-            activeTab === 'TANG_KINH_CAC' ? 'active' : ''
-          }`}
-          onClick={() => setActiveTab('TANG_KINH_CAC')}
-        >
-          <ScrollText size={18} />
-          <div>
-            <div className="tab-main-name">5. Tàng Kinh Các</div>
-            <div className="tab-sub-role">Bí Kíp Đóng Dấu ({db.sacredScrolls.length} quyển)</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          className={`module-nav-tab ${activeTab === 'OS_LOCKDOWN' ? 'active' : ''}`}
-          onClick={() => {
-            setActiveTab('OS_LOCKDOWN');
-            desktopBridge.listRunningApps().then(setRunningApps);
-          }}
-        >
-          <Shield size={18} />
-          <div>
-            <div className="tab-main-name">Phong Tỏa & Whitelist</div>
-            <div className="tab-sub-role">Hình nền Kép & Luật Núi</div>
-          </div>
-        </button>
-      </nav>
+        ))}
 
       {/* MAIN WORKSPACE CONTENT */}
-      <main className="monk-workspace-main">
-        {/* PROOF OF WORK MODE COMPARISON BANNER (MỤC 3.3 TRONG ẢNH 2) */}
-        {activeTab !== 'OS_LOCKDOWN' && (
-          <div className="pow-comparison-strip">
-            <div className="pow-strip-title">
-              <Shield size={16} color="#9E2A2B" />
-              <strong>CHẾ ĐỘ KIỂM DUYỆT HIỆN TẠI (MỤC 3.3 — PROOF OF WORK):</strong>
-            </div>
-            <div className="pow-strip-items">
-              <span className="pow-strip-badge">
-                <strong>Thực hiện Todo / Habit:</strong>{' '}
-                {db.session.isMonkModeOn
-                  ? '🔒 Khóa Pomodoro (Thoát > 30s hủy phiên)'
-                  : '☑️ Tự giác tích chọn (Checkbox thông thường)'}
-              </span>
-              <span className="pow-strip-badge">
-                <strong>Nghiệm thu Kết quả:</strong>{' '}
-                {db.session.isMonkModeOn
-                  ? '📷 Chụp ảnh Trực tiếp (Camera/Screen + OpenCV chống ảnh đen)'
-                  : 'Không yêu cầu hình ảnh minh chứng'}
-              </span>
-              <span className="pow-strip-badge">
-                <strong>Nhật ký Tự Vấn:</strong>{' '}
-                {db.session.isMonkModeOn
-                  ? '✍️ Bắt buộc >= 100 từ hợp lệ + Chặn Copy/Paste + Lexical >= 0.45'
-                  : 'Viết tự do, không giới hạn độ dài tối thiểu'}
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* =====================================================================
-            MÔ-ĐUN 1: ĐỈNH NÚI DUY NHẤT CỦA KỲ TU LUYỆN (THE PEAK - GOAL TRACKER)
-           ===================================================================== */}
-        {showGoalModule && (
+      <main className={`monk-workspace-main ${focusedStrike ? 'fullscreen-todo-main' : ''}`}>
+        {focusedStrike && (
           <section className="module-block">
-            <div className="zen-card single-peak-hero-card">
-              <div className="peak-card-top">
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                    <span className="zen-tag-red">
-                      MÔ-ĐUN 1 — ĐỈNH NÚI (THE PEAK / GOAL TRACKER)
-                    </span>
-                    <span className="time-window-pill">
-                      Mỗi kỳ tu luyện chỉ tập trung leo 1 Đỉnh Núi duy nhất &bull; Mọi Habit & Todo
-                      đều gắn trực tiếp vào Đỉnh Núi này
-                    </span>
-                  </div>
-                  <h2 style={{ fontSize: 22, marginTop: 10, color: '#F6F4EE' }}>
-                    ⛰️ {currentPeakGoal.title}
-                  </h2>
-                  <p className="zen-muted-text" style={{ marginTop: 4 }}>
-                    {currentPeakGoal.description}
-                  </p>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  {!db.session.isMonkModeOn && (
-                    <button
-                      type="button"
-                      className="zen-btn zen-btn-seal"
-                      onClick={() => {
-                        setGoalTitleDraft(currentPeakGoal.title);
-                        setGoalDescDraft(currentPeakGoal.description);
-                        setGoalTargetDraft(currentPeakGoal.targetMetric);
-                        setGoalUnitDraft(currentPeakGoal.unit);
-                        setMottoDraft(db.session.mottoText);
-                        setInitialDaysDraft(db.session.initialDays);
-                        setEditingPeakGoal((v) => !v);
-                      }}
-                    >
-                      <Edit3 size={15} />
-                      <span>
-                        {editingPeakGoal
-                          ? 'Đóng Khung Thiết Lập'
-                          : 'Thiết Lập / Đổi Mục Tiêu Đỉnh Núi'}
-                      </span>
-                    </button>
-                  )}
-
-                  {overallProgressPct >= 100 && (
-                    <WoodblockSealSvg
-                      topText="ĐỈNH NÚI"
-                      middleText="100%"
-                      bottomText="VIÊN MÃN"
-                      size={80}
-                    />
-                  )}
-                </div>
-              </div>
-
-              {/* Progress Bar of the Single Peak */}
-              <div className="peak-metric-box" style={{ marginTop: 14 }}>
-                <div className="peak-metric-row">
-                  <span>
-                    Chỉ số định lượng (KPI/OKR):{' '}
-                    <strong>
-                      {currentPeakGoal.currentMetric} / {currentPeakGoal.targetMetric}{' '}
-                      {currentPeakGoal.unit}
-                    </strong>{' '}
-                    (Hoàn thành các nhiệm vụ <strong>Công Phá - Todo List</strong> bên dưới để đẩy
-                    thanh tiến độ này về 100%)
-                  </span>
-                  <strong className="peak-pct-number">{overallProgressPct}% / 100%</strong>
-                </div>
-                <div className="zen-progress-track track-large">
-                  <div
-                    className="zen-progress-fill"
-                    style={{ width: `${overallProgressPct}%` }}
-                  />
-                </div>
-              </div>
-
-              {/* Edit Single Peak Goal Form (Only when Monk Mode is OFF) */}
-              {editingPeakGoal && !db.session.isMonkModeOn && (
-                <form
-                  className="edit-single-peak-form"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!goalTitleDraft.trim()) return;
-                    persistDb((prev) => {
-                      const currentPct = prev.peakGoals[0]?.progressPct || 0;
-                      const newTarget = Math.max(1, goalTargetDraft);
-                      const updatedGoal: PeakGoalEntity = {
-                        ...(prev.peakGoals[0] || currentPeakGoal),
-                        title: goalTitleDraft.trim(),
-                        description:
-                          goalDescDraft.trim() ||
-                          'Mục tiêu Đỉnh Núi duy nhất của kỳ tu luyện.',
-                        targetMetric: newTarget,
-                        currentMetric: Math.round((currentPct / 100) * newTarget),
-                        unit: goalUnitDraft.trim() || 'điểm KPI',
-                      };
-                      return {
-                        ...prev,
-                        session: {
-                          ...prev.session,
-                          mottoText: mottoDraft.trim() || prev.session.mottoText,
-                          initialDays: Math.max(1, initialDaysDraft),
-                          currentTargetEndTime:
-                            effectiveNow + Math.max(1, initialDaysDraft) * 86400000,
-                        },
-                        peakGoals: [updatedGoal],
-                      };
-                    });
-                    setEditingPeakGoal(false);
-                    showSternMessage(
-                      'ĐÃ CẬP NHẬT ĐỈNH NÚI & KỲ TU LUYỆN',
-                      `Mục tiêu Đỉnh Núi đã được thiết lập thành: "${goalTitleDraft.trim()}".`,
-                      'info'
-                    );
-                  }}
-                >
-                  <h4 style={{ color: '#f3a6a7', marginBottom: 8 }}>
-                    Thiết Lập Đỉnh Núi Duy Nhất Của Kỳ Tu Luyện (Khi Monk Mode: OFF)
-                  </h4>
-                  <div className="zen-form-grid">
-                    <div>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Tên Đỉnh Núi (Mục tiêu lớn duy nhất của cả kỳ):
-                      </label>
-                      <input
-                        type="text"
-                        className="zen-input"
-                        style={{ width: '100%', marginTop: 4 }}
-                        value={goalTitleDraft}
-                        onChange={(e) => setGoalTitleDraft(e.target.value)}
-                        required
-                      />
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Mô tả chi tiết & Tiêu chí nghiệm thu Đỉnh Núi:
-                      </label>
-                      <input
-                        type="text"
-                        className="zen-input"
-                        style={{ width: '100%', marginTop: 4 }}
-                        value={goalDescDraft}
-                        onChange={(e) => setGoalDescDraft(e.target.value)}
-                      />
-                    </div>
-                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Chỉ số KPI mục tiêu:
-                        <input
-                          type="number"
-                          className="zen-input"
-                          style={{ width: 110, marginLeft: 6 }}
-                          min={1}
-                          value={goalTargetDraft}
-                          onChange={(e) => setGoalTargetDraft(Number(e.target.value))}
-                        />
-                      </label>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Đơn vị đo:
-                        <input
-                          type="text"
-                          className="zen-input"
-                          style={{ width: 130, marginLeft: 6 }}
-                          value={goalUnitDraft}
-                          onChange={(e) => setGoalUnitDraft(e.target.value)}
-                        />
-                      </label>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Số ngày cam kết Lên Núi:
-                        <input
-                          type="number"
-                          className="zen-input"
-                          style={{ width: 90, marginLeft: 6 }}
-                          min={1}
-                          max={365}
-                          value={initialDaysDraft}
-                          onChange={(e) => setInitialDaysDraft(Number(e.target.value))}
-                        />
-                      </label>
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 12, color: '#B8B4A9' }}>
-                        Câu tâm niệm khắc trên màn hình chính & Bí Kíp:
-                      </label>
-                      <input
-                        type="text"
-                        className="zen-input"
-                        style={{ width: '100%', marginTop: 4 }}
-                        value={mottoDraft}
-                        onChange={(e) => setMottoDraft(e.target.value)}
-                      />
-                    </div>
-                    <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-                      <button
-                        type="button"
-                        className="zen-btn zen-btn-ghost"
-                        onClick={() => setEditingPeakGoal(false)}
-                      >
-                        Hủy
-                      </button>
-                      <button type="submit" className="zen-btn zen-btn-seal">
-                        <Check size={15} />
-                        <span>Lưu Thiết Lập Đỉnh Núi</span>
-                      </button>
-                    </div>
-                  </div>
-                </form>
-              )}
-            </div>
+            <FocusChamberView
+              focusedStrike={focusedStrike}
+              focusIsSideQuest={focusIsSideQuest}
+              focusContextTitle={focusContextTitle}
+              pomoSecondsLeft={pomoSecondsLeft}
+              pomoTotalSeconds={pomoTotalSeconds}
+              pomoRunning={pomoRunning}
+              pomoSelectedMins={pomoStartMinsRef.current}
+              activityType={focusedActivityType}
+              ambientMode={ambientMode}
+              ambientVolume={ambientVolume}
+              breakSecondsLeft={breakSecondsLeft}
+              breakTotalSeconds={breakTotalSeconds}
+              pinnedOptimizationNotes={pinnedOptimizationNotes}
+              onExitFocus={handleExitFocusMode}
+              onSelectDuration={(mins) => {
+                const secs = mins * 60;
+                pomoStartMinsRef.current = mins;
+                pomoEndTimeMsRef.current = null;
+                pomoCompletedGuardRef.current = false;
+                pomoSecondsLeftRef.current = secs;
+                setPomoRunning(false);
+                setPomoTotalSeconds(secs);
+                setPomoSecondsLeft(secs);
+                persistDb((prev) => ({
+                  ...prev,
+                  dailyStrikes: prev.dailyStrikes.map((s) =>
+                    s.id === focusedStrike.id
+                      ? {
+                          ...s,
+                          requiredPomodoroMins: mins,
+                          savedPomoSecondsLeft: null,
+                          savedPomoTotalSeconds: null,
+                          savedPomoSelectedMins: null,
+                        }
+                      : s
+                  ),
+                }));
+              }}
+              onToggleRun={handleTogglePomoRun}
+              onResetTimer={() => handleResetPomoTimer()}
+              onFinishActualSession={handleFinishActualPomoSession}
+              onChangeActivityType={(nextType) => {
+                soundEngine.playWoodenFish(0.5);
+                persistDb((prev) => ({
+                  ...prev,
+                  dailyStrikes: prev.dailyStrikes.map((s) =>
+                    s.id === focusedStrike.id ? { ...s, activityType: nextType } : s
+                  ),
+                }));
+              }}
+              onChangeAmbientMode={handleChangeAmbientMode}
+              onChangeAmbientVolume={handleChangeAmbientVolume}
+              onStartBreak={startBreakTimer}
+              onCancelBreak={cancelBreakTimer}
+              onUpdateNotes={(strikeId, notes) => {
+                persistDb((prev) => ({
+                  ...prev,
+                  dailyStrikes: prev.dailyStrikes.map((s) =>
+                    s.id === strikeId ? { ...s, notes } : s
+                  ),
+                }));
+              }}
+              onSaveQuickOptimizationNote={handleSaveQuickOptimizationNote}
+              onApplyOptimizationNote={handleApplyOptimizationNote}
+              onToggleRequiresPhoto={handleToggleStrikeRequiresPhoto}
+              onOpenProofModal={(strike, markCompleteAfterProof) =>
+                setProofModalTarget({
+                  strikeId: strike.id,
+                  title: strike.title,
+                  markCompleteAfterProof,
+                })
+              }
+              onCompleteStrikeAction={handleCompleteStrikeAction}
+              onZoomPhoto={setZoomedHistoryPhoto}
+            />
           </section>
         )}
 
-        {/* =====================================================================
-            SIDE-BY-SIDE: MÔ-ĐUN 2 (HABIT TRACKER) & MÔ-ĐUN 3 (TODO LIST)
-           ===================================================================== */}
-        {(showRitualsModule || showStrikesModule) && (
-          <div
-            className={
-              showRitualsModule && showStrikesModule
-                ? 'dual-modules-grid'
-                : 'single-module-full'
+        {!focusedStrike && !selectedGoal && (
+          <>
+            {outerTab === 'GOALS_LIST' && (
+              <GoalsHubView
+                peakGoals={db.peakGoals}
+                nowTick={nowTick}
+                todayStr={todayStr}
+                climbingSchedulePlan={db.climbingSchedulePlan}
+                getMountainStats={getMountainStats}
+                onOpenCreateGoalModal={handleOpenCreateGoalModal}
+                onOpenEditGoalModal={handleOpenEditGoalModal}
+                onSelectGoal={(goalId) => {
+                  soundEngine.playWoodenFish(0.6);
+                  setSelectedGoalId(goalId);
+                  setInnerTab('DAILY_STRIKES');
+                  setFocusedStrikeId(null);
+                }}
+                onToggleChecklistItem={handleToggleMilestone}
+                onRequestDeleteGoal={(goal, strikeCount) =>
+                  setConfirmDeleteTarget({
+                    kind: 'GOAL',
+                    id: goal.id,
+                    title: goal.title,
+                    strikeCount,
+                  })
+                }
+                onGoToRituals={() => setOuterTab('RITUALS')}
+                onGoToAISchedule={() => setOuterTab('AI_SCHEDULE')}
+              />
+            )}
+
+            {outerTab === 'AI_SCHEDULE' && (
+              <AIScheduleView
+                db={db}
+                todayStr={todayStr}
+                nowTick={nowTick}
+                activeShiftMode={activeShiftMode}
+                dayShiftStartTime={dayShiftStartTime}
+                nightShiftStartTime={nightShiftStartTime}
+                onPersistDb={persistDb}
+                onCreateStrikeFromSlot={handleCreateStrikeFromSlot}
+                onEnterFocusStrike={(strike) => enterFocusModeForStrike(strike, false)}
+                onSelectGoal={(goalId) => {
+                  soundEngine.playWoodenFish(0.6);
+                  setSelectedGoalId(goalId);
+                  setInnerTab('DAILY_STRIKES');
+                  setFocusedStrikeId(null);
+                }}
+                onUpdateShiftConfig={handleUpdateShiftConfig}
+                onPopulateTodayFromSchedule={handlePopulateTodayFromSchedule}
+                onSaveScheduleProfile={handleSaveScheduleProfile}
+                onLoadScheduleProfile={handleLoadScheduleProfile}
+                onDeleteScheduleProfile={handleDeleteScheduleProfile}
+                onPlayWoodenFish={(v) => soundEngine.playWoodenFish(v)}
+                onPlayTempleBell={(v) => soundEngine.playTempleBell(v)}
+                onShowMessage={showSternMessage}
+              />
+            )}
+
+            {outerTab === 'TIME_AUDIT' && (
+              <TimeAuditView
+                db={db}
+                todayStr={todayStr}
+                nowTick={nowTick}
+                activeShiftMode={activeShiftMode}
+                dayShiftStartTime={dayShiftStartTime}
+                nightShiftStartTime={nightShiftStartTime}
+                liveActiveSession={liveActiveSession}
+                onAddManualTimeLog={handleAddManualTimeLog}
+                onDeleteTimeLog={handleDeleteTimeLog}
+                onUpdateTimeAuditConfig={handleUpdateTimeAuditConfig}
+                onConfirmWorkShift={handleConfirmWorkShift}
+                onClearWorkShift={handleClearWorkShift}
+                onGoToAIScheduleTab={() => setOuterTab('AI_SCHEDULE')}
+                onSelectGoal={(goalId) => {
+                  soundEngine.playWoodenFish(0.6);
+                  setSelectedGoalId(goalId);
+                  setInnerTab('DAILY_STRIKES');
+                  setFocusedStrikeId(null);
+                }}
+              />
+            )}
+
+            {outerTab === 'OPTIMIZATION_VAULT' && (
+              <OptimizationVaultView
+                db={db}
+                todayStr={todayStr}
+                onPersistDb={persistDb}
+                onPlayWoodenFish={(v) => soundEngine.playWoodenFish(v)}
+                onPlayWoodblockStamp={() => soundEngine.playWoodblockStampSound()}
+                onShowMessage={showSternMessage}
+              />
+            )}
+
+            {outerTab === 'SIDE_QUESTS' && (
+              <SideQuestsView
+                todayStr={todayStr}
+                templates={SIDE_QUEST_TEMPLATES}
+                stats={sideQuestStats}
+                sideQuestTitle={sideQuestTitle}
+                sideQuestPomo={sideQuestPomo}
+                sideQuestActivityType={sideQuestActivityType}
+                sideQuestRequiresPhoto={sideQuestRequiresPhoto}
+                sideQuestShowHistory={sideQuestShowHistory}
+                onChangeTitle={setSideQuestTitle}
+                onChangePomo={setSideQuestPomo}
+                onChangeActivityType={setSideQuestActivityType}
+                onToggleRequiresPhoto={() => setSideQuestRequiresPhoto((v) => !v)}
+                onChangeShowHistory={setSideQuestShowHistory}
+                onCreateSideQuest={createSideQuest}
+                onUpdateSideQuest={handleUpdateSideQuest}
+                onEnterFocusStrike={(strike, autoStart) =>
+                  enterFocusModeForStrike(strike, Boolean(autoStart))
+                }
+                onCompleteStrikeAction={handleCompleteStrikeAction}
+                onDeleteSideQuest={(strikeId) =>
+                  persistDb((prev) => ({
+                    ...prev,
+                    dailyStrikes: prev.dailyStrikes.filter((s) => s.id !== strikeId),
+                  }))
+                }
+                onZoomPhoto={setZoomedHistoryPhoto}
+              />
+            )}
+
+            {outerTab === 'RITUALS' && (
+              <RitualsView
+                db={db}
+                todayStr={todayStr}
+                ritualStatsToday={ritualStatsToday}
+                draggingRitualItem={draggingRitualItem}
+                dragOverTargetIndex={dragOverTargetIndex}
+                onPersistDb={persistDb}
+                onPlayWoodenFish={(v) => soundEngine.playWoodenFish(v)}
+                onRequestDeleteGroup={(group) =>
+                  setConfirmDeleteTarget({
+                    kind: 'RITUAL_GROUP',
+                    id: group.id,
+                    title: group.title,
+                    itemCount: group.items.length,
+                  })
+                }
+                onDragStartItem={handleDragStartRitualItem}
+                onDragOverItem={handleDragOverRitualItem}
+                onDropItem={handleDropRitualItem}
+                onDragEndItem={handleDragEndRitualItem}
+                onMoveItem={handleMoveRitualItem}
+              />
+            )}
+
+            {outerTab === 'LAWS' && (
+              <LawsView
+                db={db}
+                todayStr={todayStr}
+                nowTick={nowTick}
+                lawsActive={lawsActive}
+                activeShiftMode={activeShiftMode}
+                dayShiftStartTime={dayShiftStartTime}
+                nightShiftStartTime={nightShiftStartTime}
+                timeLeftToday={timeLeftToday}
+                todayLawPreview={todayLawPreview}
+                lawConfig={lawConfig}
+                onAcceptLaws={handleAcceptLaws}
+                onRunLawEvaluationTodayNow={handleRunLawEvaluationTodayNow}
+                onSwitchWorkShift={handleSwitchWorkShift}
+                onUpdateShiftConfig={handleUpdateShiftConfig}
+                onToggleLaw={handleToggleLaw}
+                onChangeRitualThresholdPct={handleChangeRitualThresholdPct}
+                onToggleRitualItem={handleToggleRitualItemToday}
+                onGoToRitualsTab={() => setOuterTab('RITUALS')}
+                onSelectGoal={(goalId) => {
+                  soundEngine.playWoodenFish(0.6);
+                  setSelectedGoalId(goalId);
+                  setInnerTab('DAILY_STRIKES');
+                  setFocusedStrikeId(null);
+                }}
+                onGoToAIScheduleTab={() => setOuterTab('AI_SCHEDULE')}
+                onRegisterRestDay={handleRegisterRestDay}
+                onCancelRestDay={handleCancelRestDay}
+                onChangeMaxMonthlyRestDays={handleChangeMaxMonthlyRestDays}
+              />
+            )}
+
+            {outerTab === 'TANG_KINH_CAC' && (
+              <TangKinhCacView
+                db={db}
+                todayStr={todayStr}
+                sacredScrolls={db.sacredScrolls}
+                onOpenScroll={(scroll) => {
+                  soundEngine.playWoodenFish(0.65);
+                  setViewingScroll(scroll);
+                }}
+              />
+            )}
+
+            {outerTab === 'SETTINGS' && (
+              <SettingsView
+                db={db}
+                todayStr={todayStr}
+                daemonStatus={daemonStatus}
+                autoStartStatus={autoStartStatus}
+                confirmResetMode={confirmResetMode}
+                globalMottoDraft={globalMottoDraft}
+                todayTaskModsCount={todayTaskMods.length}
+                maxDailyTaskMods={maxDailyTaskMods}
+                onSetConfirmResetMode={setConfirmResetMode}
+                onChangeGlobalMottoDraft={setGlobalMottoDraft}
+                onPersistDb={persistDb}
+                onReplaceDb={setDb}
+                onSetAutoStartStatus={setAutoStartStatus}
+                onAnnounceLawVerdict={announceLawVerdict}
+                onResetSelectedStateAfterWipe={(fresh) => {
+                  setDb(fresh);
+                  setSelectedGoalId(null);
+                  setFocusedStrikeId(null);
+                  setGlobalMottoDraft(fresh.session.mottoText);
+                }}
+                onPlayTempleBell={(v) => soundEngine.playTempleBell(v)}
+                onShowMessage={showSternMessage}
+              />
+            )}
+          </>
+        )}
+
+        {!focusedStrike && selectedGoal && (
+          <GoalInnerView
+            db={db}
+            selectedGoal={selectedGoal}
+            innerTab={innerTab}
+            todayStr={todayStr}
+            nowTick={nowTick}
+            remainingTaskMods={remainingTaskMods}
+            maxDailyTaskMods={maxDailyTaskMods}
+            ritualStatsToday={ritualStatsToday}
+            draggingRitualItem={draggingRitualItem}
+            dragOverTargetIndex={dragOverTargetIndex}
+            onChangeInnerTab={setInnerTab}
+            onPersistDb={persistDb}
+            onToggleMilestone={handleToggleMilestone}
+            onQuickAddChecklistItem={handleQuickAddChecklistItem}
+            onDeleteChecklistItem={handleDeleteChecklistItem}
+            onEnterFocusStrike={(strike) => enterFocusModeForStrike(strike, false)}
+            onCompleteStrikeAction={handleCompleteStrikeAction}
+            onToggleStrikeRequiresPhoto={handleToggleStrikeRequiresPhoto}
+            onOpenProofModal={(strike, markCompleteAfterProof) =>
+              setProofModalTarget({
+                strikeId: strike.id,
+                title: strike.title,
+                markCompleteAfterProof,
+              })
             }
-          >
-            {/* MÔ-ĐUN 2: NGHI THỨC (RITUALS - HABIT TRACKER) */}
-            {showRitualsModule && (
-              <section className="zen-card module-column-card">
-                <div className="module-col-header">
-                  <div>
-                    <span className="zen-tag-red">MÔ-ĐUN 2 — HABIT TRACKER</span>
-                    <h3 style={{ fontSize: 20, marginTop: 6 }}>
-                      🔥 Nghi Thức (Rituals) — Kỷ Luật Lặp Lại Theo Khung Giờ
-                    </h3>
-                    <p className="zen-muted-text" style={{ fontSize: 13 }}>
-                      Các kỷ luật lặp lại hàng ngày theo khung giờ cố định (VD: Dậy lúc 05:00, Đọc
-                      sách 60 phút). Bỏ lỡ khung giờ quy định mà chưa hoàn thành sẽ bị tính là{' '}
-                      <strong>vi phạm Luật Núi</strong>.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="rituals-list" style={{ marginTop: 14 }}>
-                  {db.ritualHabits.map((ritual) => {
-                    const todayDone = ritual.completionsByDate[todayStr];
-
-                    return (
-                      <div
-                        key={ritual.id}
-                        className={`task-interactive-row ${todayDone ? 'row-completed' : ''}`}
-                      >
-                        {/* Left Checkbox / Trigger */}
-                        <div className="task-check-col">
-                          {!db.session.isMonkModeOn ? (
-                            <button
-                              type="button"
-                              className={`checkbox-square-btn ${todayDone ? 'checked' : ''}`}
-                              onClick={() => handleRitualAction(ritual)}
-                              title="Chế độ Monk Mode OFF: Tự giác tích chọn (Checkbox thông thường)"
-                            >
-                              {todayDone ? <CheckSquare size={22} /> : <Square size={22} />}
-                            </button>
-                          ) : todayDone ? (
-                            <WoodblockSealSvg
-                              topText="GIỮ"
-                              middleText="GIỚI"
-                              bottomText="LUẬT"
-                              size={54}
-                            />
-                          ) : (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-seal"
-                              style={{ padding: '8px 10px', fontSize: 12 }}
-                              onClick={() => handleRitualAction(ritual)}
-                            >
-                              <Flame size={15} />
-                              <span>Pomodoro ({ritual.requiredPomodoroMins}p)</span>
-                            </button>
-                          )}
-                        </div>
-
-                        {/* Middle Info */}
-                        <div className="task-body-col">
-                          <div className="ritual-meta-tags">
-                            <span className="time-window-pill">
-                              <Clock size={12} /> Khung giờ: {ritual.timeWindowStart} –{' '}
-                              {ritual.timeWindowEnd}
-                            </span>
-                            <span className="pomo-pill">
-                              <Flame size={12} /> {ritual.requiredPomodoroMins} phút
-                            </span>
-                            {ritual.requiresPhoto && (
-                              <span className="pow-pill">
-                                <Camera size={12} /> Cần ảnh PoW khi bật Monk Mode
-                              </span>
-                            )}
-                          </div>
-
-                          <div
-                            className="task-row-title"
-                            style={{
-                              textDecoration: todayDone ? 'line-through' : 'none',
-                              color: todayDone ? '#9E9A8E' : '#F6F4EE',
-                            }}
-                          >
-                            {ritual.title}
-                          </div>
-
-                          {todayDone && (
-                            <div className="task-done-caption">
-                              ✓ Đã hoàn thành hôm nay lúc{' '}
-                              {new Date(todayDone.completedAt).toLocaleTimeString('vi-VN')}
-                            </div>
-                          )}
-
-                          {todayDone?.proofPhotoUri && (
-                            <div className="inline-proof-thumb">
-                              <img src={todayDone.proofPhotoUri} alt="Proof" />
-                              <span>Ảnh bằng chứng PoW đã đóng dấu</span>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Right Actions */}
-                        <div className="task-actions-col">
-                          {db.session.isMonkModeOn && !todayDone && (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-outline"
-                              style={{ padding: '5px 8px', fontSize: 11 }}
-                              onClick={() =>
-                                triggerMountainLawViolation(
-                                  'MISSED_RITUAL',
-                                  `Bỏ lỡ khung giờ Nghi thức "${ritual.title}" (${ritual.timeWindowStart}–${ritual.timeWindowEnd})`
-                                )
-                              }
-                              title="Giả lập bỏ lỡ khung giờ quy định để kiểm tra hình phạt Luật Núi"
-                            >
-                              Phạt trễ giờ
-                            </button>
-                          )}
-                          {!db.session.isMonkModeOn && (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-ghost"
-                              onClick={() =>
-                                persistDb((prev) => ({
-                                  ...prev,
-                                  ritualHabits: prev.ritualHabits.filter((r) => r.id !== ritual.id),
-                                }))
-                              }
-                              title="Xóa Nghi thức"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Inline Add Habit Form */}
-                <form
-                  className="inline-add-box"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!newRitualTitle.trim()) return;
-                    const created: RitualHabitEntity = {
-                      id: `ritual-${Date.now()}`,
-                      goalId: currentPeakGoal.id,
-                      title: newRitualTitle.trim(),
-                      timeWindowStart: newRitualStart,
-                      timeWindowEnd: newRitualEnd,
-                      requiredPomodoroMins: Math.max(5, newRitualPomo),
-                      requiresPhoto: newRitualPhoto,
-                      completionsByDate: {},
-                      violatedDates: {},
-                    };
-                    persistDb((prev) => ({
-                      ...prev,
-                      ritualHabits: [...prev.ritualHabits, created],
-                    }));
-                    setNewRitualTitle('');
-                  }}
-                >
-                  <div className="inline-add-header">+ Thêm Nghi Thức (Habit Tracker) Mới:</div>
-                  <input
-                    type="text"
-                    className="zen-input"
-                    placeholder="Nhập thói quen kỷ luật (VD: Dậy lúc 05:00, Đọc sách 60 phút...)"
-                    value={newRitualTitle}
-                    onChange={(e) => setNewRitualTitle(e.target.value)}
-                    required
-                  />
-                  <div className="inline-add-controls">
-                    <label>
-                      Từ:{' '}
-                      <input
-                        type="time"
-                        className="zen-input"
-                        style={{ width: 102, padding: '4px 6px' }}
-                        value={newRitualStart}
-                        onChange={(e) => setNewRitualStart(e.target.value)}
-                      />
-                    </label>
-                    <label>
-                      Đến:{' '}
-                      <input
-                        type="time"
-                        className="zen-input"
-                        style={{ width: 102, padding: '4px 6px' }}
-                        value={newRitualEnd}
-                        onChange={(e) => setNewRitualEnd(e.target.value)}
-                      />
-                    </label>
-                    <label>
-                      Pomodoro (phút):{' '}
-                      <input
-                        type="number"
-                        className="zen-input"
-                        style={{ width: 64, padding: '4px 6px' }}
-                        min={5}
-                        max={180}
-                        value={newRitualPomo}
-                        onChange={(e) => setNewRitualPomo(Number(e.target.value))}
-                      />
-                    </label>
-                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                      <input
-                        type="checkbox"
-                        checked={newRitualPhoto}
-                        onChange={(e) => setNewRitualPhoto(e.target.checked)}
-                      />
-                      Cần ảnh PoW
-                    </label>
-                    <button type="submit" className="zen-btn zen-btn-seal">
-                      <Plus size={15} /> Thêm Habit
-                    </button>
-                  </div>
-                </form>
-              </section>
-            )}
-
-            {/* MÔ-ĐUN 3: CÔNG PHÁ (DAILY STRIKES - TODO LIST) */}
-            {showStrikesModule && (
-              <section className="zen-card module-column-card">
-                <div className="module-col-header">
-                  <div>
-                    <span className="zen-tag-red">MÔ-ĐUN 3 — TODO LIST</span>
-                    <h3 style={{ fontSize: 20, marginTop: 6 }}>
-                      ⚔️ Công Phá (Daily Strikes) — Nhiệm Vụ Tác Chiến Trong Ngày
-                    </h3>
-                    <p className="zen-muted-text" style={{ fontSize: 13 }}>
-                      Danh sách các nhiệm vụ tác chiến cụ thể cần giải quyết dứt điểm trước 23:59 để{' '}
-                      <strong>đẩy thanh tiến độ của Đỉnh Núi tiến về mốc 100%</strong>.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="rituals-list" style={{ marginTop: 14 }}>
-                  {db.dailyStrikes.map((strike) => {
-                    const isDone = strike.status === 'COMPLETED';
-
-                    return (
-                      <div
-                        key={strike.id}
-                        className={`task-interactive-row ${isDone ? 'row-completed' : ''}`}
-                      >
-                        {/* Left Checkbox / Trigger */}
-                        <div className="task-check-col">
-                          {!db.session.isMonkModeOn ? (
-                            <button
-                              type="button"
-                              className={`checkbox-square-btn ${isDone ? 'checked' : ''}`}
-                              onClick={() => handleStrikeAction(strike)}
-                              title="Chế độ Monk Mode OFF: Tích chọn để cộng ngay % vào Đỉnh Núi"
-                            >
-                              {isDone ? <CheckSquare size={22} /> : <Square size={22} />}
-                            </button>
-                          ) : isDone ? (
-                            <WoodblockSealSvg
-                              topText="CÔNG PHÁ"
-                              middleText={`+${strike.weightPct}%`}
-                              bottomText="HOÀN TẤT"
-                              size={54}
-                            />
-                          ) : (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-seal"
-                              style={{ padding: '8px 10px', fontSize: 12 }}
-                              onClick={() => handleStrikeAction(strike)}
-                            >
-                              <Swords size={15} />
-                              <span>Công Phá ({strike.requiredPomodoroMins}p)</span>
-                            </button>
-                          )}
-                        </div>
-
-                        {/* Middle Info */}
-                        <div className="task-body-col">
-                          <div className="ritual-meta-tags">
-                            <span className="weight-pill">
-                              Đẩy Đỉnh Núi: <strong>+{strike.weightPct}%</strong>
-                            </span>
-                            <span className="time-window-pill">
-                              <Clock size={12} /> Hẹn giờ: {strike.scheduledTime}
-                            </span>
-                            <span className="pomo-pill">
-                              <Flame size={12} /> {strike.requiredPomodoroMins}p Pomodoro
-                            </span>
-                            <span className="pow-pill">
-                              <Camera size={12} /> Live PoW
-                            </span>
-                          </div>
-
-                          <div
-                            className="task-row-title"
-                            style={{
-                              textDecoration: isDone ? 'line-through' : 'none',
-                              color: isDone ? '#9E9A8E' : '#F6F4EE',
-                            }}
-                          >
-                            {strike.title}
-                          </div>
-
-                          {isDone && (
-                            <div className="task-done-caption">
-                              ✓ Đã hoàn thành & đóng góp +{strike.weightPct}% vào Đỉnh Núi
-                            </div>
-                          )}
-
-                          {strike.proofPhotoUri && (
-                            <div className="inline-proof-thumb">
-                              <img src={strike.proofPhotoUri} alt={strike.title} />
-                              <div>
-                                <span>Đã nghiệm thu ảnh PoW</span>
-                                {strike.proofAnalysis && (
-                                  <div style={{ fontSize: 11, color: '#B8B4A9' }}>
-                                    Sáng: {strike.proofAnalysis.brightness} | Nét:{' '}
-                                    {strike.proofAnalysis.sharpness}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Right Actions */}
-                        <div className="task-actions-col">
-                          {!isDone && (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-outline"
-                              style={{ padding: '5px 8px', fontSize: 11 }}
-                              onClick={() =>
-                                setNaggingAlert({
-                                  level: 1,
-                                  targetId: strike.id,
-                                  targetType: 'STRIKE',
-                                  title: strike.title,
-                                  scheduledWindow: strike.scheduledTime,
-                                  requiredPomodoroMins: strike.requiredPomodoroMins,
-                                })
-                              }
-                              title="Thử chuông chùa nhắc nhở Cấp độ 1 & Cấp độ 2"
-                            >
-                              <Bell size={12} /> Báo chuông
-                            </button>
-                          )}
-                          {!db.session.isMonkModeOn && (
-                            <button
-                              type="button"
-                              className="zen-btn zen-btn-ghost"
-                              onClick={() =>
-                                persistDb((prev) => ({
-                                  ...prev,
-                                  dailyStrikes: prev.dailyStrikes.filter((s) => s.id !== strike.id),
-                                }))
-                              }
-                              title="Xóa Todo"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Inline Add Todo Form */}
-                <form
-                  className="inline-add-box"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!newStrikeTitle.trim()) return;
-                    const created: DailyStrikeTodoEntity = {
-                      id: `strike-${Date.now()}`,
-                      goalId: currentPeakGoal.id,
-                      date: todayStr,
-                      title: newStrikeTitle.trim(),
-                      scheduledTime: newStrikeTime,
-                      weightPct: Math.max(5, Math.min(100, newStrikeWeight)),
-                      status: 'PENDING',
-                      requiredPomodoroMins: Math.max(5, newStrikePomo),
-                      completedPomodoroMins: 0,
-                      proofPhotoUri: null,
-                      proofAnalysis: null,
-                    };
-                    persistDb((prev) => ({
-                      ...prev,
-                      dailyStrikes: [...prev.dailyStrikes, created],
-                    }));
-                    setNewStrikeTitle('');
-                  }}
-                >
-                  <div className="inline-add-header">+ Thêm Nhiệm Vụ Công Phá (Todo List) Mới:</div>
-                  <input
-                    type="text"
-                    className="zen-input"
-                    placeholder="Nhập nhiệm vụ tác chiến cần giải quyết dứt điểm trong ngày..."
-                    value={newStrikeTitle}
-                    onChange={(e) => setNewStrikeTitle(e.target.value)}
-                    required
-                  />
-                  <div className="inline-add-controls">
-                    <label>
-                      Trọng số đẩy Đỉnh Núi (%):{' '}
-                      <input
-                        type="number"
-                        className="zen-input"
-                        style={{ width: 64, padding: '4px 6px' }}
-                        min={5}
-                        max={100}
-                        value={newStrikeWeight}
-                        onChange={(e) => setNewStrikeWeight(Number(e.target.value))}
-                      />
-                    </label>
-                    <label>
-                      Giờ hẹn:{' '}
-                      <input
-                        type="time"
-                        className="zen-input"
-                        style={{ width: 102, padding: '4px 6px' }}
-                        value={newStrikeTime}
-                        onChange={(e) => setNewStrikeTime(e.target.value)}
-                      />
-                    </label>
-                    <label>
-                      Pomodoro (phút):{' '}
-                      <input
-                        type="number"
-                        className="zen-input"
-                        style={{ width: 64, padding: '4px 6px' }}
-                        min={5}
-                        max={180}
-                        value={newStrikePomo}
-                        onChange={(e) => setNewStrikePomo(Number(e.target.value))}
-                      />
-                    </label>
-                    <button type="submit" className="zen-btn zen-btn-seal">
-                      <Plus size={15} /> Thêm Todo
-                    </button>
-                  </div>
-                </form>
-              </section>
-            )}
-          </div>
-        )}
-
-        {/* =====================================================================
-            MÔ-ĐUN 4: NHẬT KÝ TỰ VẤN CUỐI NGÀY (DAILY JOURNAL - REFLECTION)
-           ===================================================================== */}
-        {showReflectionModule && (
-          <section className="module-block" style={{ marginTop: 22 }}>
-            <div className="reflection-layout">
-              <div className="zen-card reflection-editor-card">
-                <div className="section-header-row" style={{ marginBottom: 12 }}>
-                  <div>
-                    <span className="zen-tag-red">MÔ-ĐUN 4 — DAILY JOURNAL</span>
-                    <h3 style={{ fontSize: 20, marginTop: 6 }}>
-                      ✍️ Tự Vấn (Reflection) — Nghi Thức Nghiệm Thu & Sám Hối Cuối Ngày
-                    </h3>
-                    <p className="zen-muted-text" style={{ fontSize: 13 }}>
-                      {db.session.isMonkModeOn
-                        ? 'Đang bật Monk Mode: ON — Bắt buộc mở từ 20:00–23:59, đếm đủ tối thiểu 100 từ hợp lệ, chặn hoàn toàn Copy/Paste và kiểm tra mật độ từ vựng (Lexical Diversity >= 0.45).'
-                        : 'Đang ở chế độ Monk Mode: OFF — Viết tự do, không giới hạn độ dài tối thiểu.'}
-                    </p>
-                  </div>
-
-                  {db.session.isMonkModeOn && !isReflectionWindowOpen && (
-                    <button
-                      type="button"
-                      className="zen-btn zen-btn-seal"
-                      onClick={() => setForceOpenReflectionWindow(true)}
-                    >
-                      <Clock size={15} />
-                      <span>Mở Cổng Tự Vấn Ngay (Giả Lập 21:00)</span>
-                    </button>
-                  )}
-                </div>
-
-                {clipboardBlockedMsg && (
-                  <div className="zen-alert-box alert-danger" style={{ marginBottom: 12 }}>
-                    <AlertTriangle size={18} />
-                    <span>{clipboardBlockedMsg}</span>
-                  </div>
-                )}
-
-                <form onSubmit={handleSubmitJournal}>
-                  <textarea
-                    className="zen-textarea reflection-textarea"
-                    rows={6}
-                    disabled={!isReflectionWindowOpen}
-                    placeholder={
-                      isReflectionWindowOpen
-                        ? db.session.isMonkModeOn
-                          ? 'MONK MODE ON: Hãy tự tay gõ ít nhất 100 từ hợp lệ nhìn nhận lại sự tập trung trong ngày (Chặn hoàn toàn Copy/Paste & gõ ký tự rác lặp lại)...'
-                          : 'MONK MODE OFF: Viết tự do nhật ký Tự Vấn trong ngày (không giới hạn số từ tối thiểu)...'
-                        : 'Khi bật Monk Mode, cổng Tự Vấn chỉ mở từ 20:00 đến 23:59. Bấm nút "Mở Cổng Tự Vấn Ngay (Giả Lập 21:00)" phía trên để kiểm thử ngay.'
-                    }
-                    value={journalDraft}
-                    onChange={(e) => setJournalDraft(e.target.value)}
-                    onPaste={(e) => {
-                      if (db.session.isMonkModeOn) {
-                        e.preventDefault();
-                        soundEngine.playWoodenFish(0.9);
-                        setClipboardBlockedMsg(
-                          'GIỚI LUẬT TỰ VẤN (MỤC 3.3): Chặn hoàn toàn thao tác Copy/Paste (Clipboard đã bị vô hiệu hóa khi bật Monk Mode)!'
-                        );
-                      }
-                    }}
-                    onCopy={(e) => {
-                      if (db.session.isMonkModeOn) e.preventDefault();
-                    }}
-                    onCut={(e) => {
-                      if (db.session.isMonkModeOn) e.preventDefault();
-                    }}
-                    onDrop={(e) => {
-                      if (db.session.isMonkModeOn) {
-                        e.preventDefault();
-                        setClipboardBlockedMsg('Chặn kéo-thả văn bản vào khung Tự Vấn!');
-                      }
-                    }}
-                  />
-
-                  <div className="lexical-inspector-bar">
-                    <div className="lexical-metric">
-                      <span>Số từ thực tế hợp lệ:</span>
-                      <strong
-                        style={{
-                          color:
-                            !db.session.isMonkModeOn || journalAnalysis.validWordCount >= 100
-                              ? '#4CAF50'
-                              : '#EF5350',
-                        }}
-                      >
-                        {journalAnalysis.validWordCount}{' '}
-                        {db.session.isMonkModeOn ? '/ 100 từ bắt buộc' : 'từ (Tự do)'}
-                      </strong>
-                    </div>
-
-                    <div className="lexical-metric">
-                      <span>Mật độ từ vựng (Lexical Diversity):</span>
-                      <strong
-                        style={{
-                          color:
-                            !db.session.isMonkModeOn ||
-                            journalAnalysis.lexicalDiversityScore >= 0.45
-                              ? '#4CAF50'
-                              : '#EF5350',
-                        }}
-                      >
-                        {journalAnalysis.lexicalDiversityScore}{' '}
-                        {db.session.isMonkModeOn ? '(Yêu cầu >= 0.45)' : ''}
-                      </strong>
-                    </div>
-
-                    <div className="lexical-metric">
-                      <span>Từ rác/lặp bị loại:</span>
-                      <strong>{journalAnalysis.invalidSpamWords}</strong>
-                    </div>
-                  </div>
-
-                  <div className="reflection-actions-row">
-                    <button
-                      type="button"
-                      className="zen-btn zen-btn-outline"
-                      disabled={!isReflectionWindowOpen}
-                      onClick={() => {
-                        setJournalDraft(
-                          'Đêm nay ngồi trước màn hình trong không gian tĩnh mịch của đỉnh núi, tôi nhìn nhận lại toàn bộ hành trình làm việc từ sáng sớm lúc năm giờ cho đến giờ phút này. Buổi sáng khi tiếng chuông chùa vang lên, tôi đã lập tức bước vào phiên thiền định Pomodoro đầu tiên mà không trì hoãn dù chỉ một phút. Những nhiệm vụ công phá khó khăn nhất của dự án đã được giải quyết triệt để bằng sự tập trung cao độ. Dù buổi chiều đôi lúc tâm trí có khởi lên chút mệt mỏi, nhưng nhìn vào câu tâm niệm trên màn hình và dấu mộc đỏ Chu Sa, ý chí lại trở nên sắc bén như kiếm thép. Hôm nay tôi giữ trọn vẹn giới luật, xứng đáng tiến thêm một bước gần hơn tới ngày đắc đạo xuống núi.'
-                        );
-                        setRepentanceDraft(
-                          'Giữ vững chánh niệm 100%, không để ngoại cảnh chi phối.'
-                        );
-                      }}
-                    >
-                      <Sparkles size={15} />
-                      <span>Điền mẫu 135 từ hợp lệ (Test vượt kiểm duyệt)</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      className="zen-btn zen-btn-outline"
-                      disabled={!isReflectionWindowOpen}
-                      onClick={() => {
-                        setJournalDraft(
-                          'aaaa bbbb cccc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc tôi làm việc 12345 99999 asdfghjkl'
-                        );
-                      }}
-                    >
-                      <span>Thử điền văn bản lặp từ / gõ rác (Test bị chặn)</span>
-                    </button>
-
-                    <div style={{ flex: 1 }} />
-
-                    <button
-                      type="submit"
-                      className="zen-btn zen-btn-seal"
-                      disabled={
-                        !isReflectionWindowOpen ||
-                        (db.session.isMonkModeOn && !journalAnalysis.isPassingInMonkMode)
-                      }
-                    >
-                      <Check size={16} />
-                      <span>Đóng Ấn Lưu Nhật Ký Tự Vấn</span>
-                    </button>
-                  </div>
-                </form>
-              </div>
-
-              <div className="zen-card reflection-history-card">
-                <h3>Nhật Trình Tự Vấn Đã Lưu ({db.reflectionJournals.length} bản ghi)</h3>
-                <div className="journal-history-list">
-                  {db.reflectionJournals.map((j) => (
-                    <div key={j.id} className="journal-history-item">
-                      <div className="journal-item-header">
-                        <strong>Đêm {j.date}</strong>
-                        <span className="zen-tag-red">
-                          {j.validWordCount} từ &bull; Lexical: {j.lexicalDiversityScore}
-                        </span>
-                      </div>
-                      <p>{j.content}</p>
-                      <div className="journal-item-footer">
-                        <span>Độ tập trung: {j.focusRating}/5</span>
-                        <span>{j.repentanceNote}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* =====================================================================
-            MÔ-ĐUN 5: TÀNG KINH CÁC (SACRED ARCHIVE - BÍ KÍP TU LUYỆN)
-           ===================================================================== */}
-        {showArchiveModule && (
-          <section className="module-block" style={{ marginTop: 22 }}>
-            <div className="zen-card">
-              <div className="section-header-row" style={{ marginBottom: 14 }}>
-                <div>
-                  <span className="zen-tag-red">MÔ-ĐUN 5 — SACRED ARCHIVE (TÀNG KINH CÁC)</span>
-                  <h3 style={{ fontSize: 22, marginTop: 6 }}>
-                    📜 Bí Kíp Tu Luyện (Tàng Kinh Các) — Kệ Sách Cổ Thư Đóng Dấu Mộc Đỏ Chu Sa
-                  </h3>
-                  <p className="zen-muted-text">
-                    Khi hoàn thành 100% khóa tu luyện và xuống núi, toàn bộ nhật trình được đóng
-                    quyển thành một cuốn Bí Kíp cổ thư kèm <strong>Dấu Mộc Đỏ Chu Sa</strong> để kẻ
-                    tu luyện bấm vào mở ra lật trang đọc lại hoặc xuất file PDF bất cứ lúc nào.
-                  </p>
-                </div>
-              </div>
-
-              <div className="sacred-scrolls-shelf">
-                {db.sacredScrolls.map((scroll) => (
-                  <div
-                    key={scroll.id}
-                    className="ancient-scroll-shelf-card"
-                    onClick={() => {
-                      soundEngine.playWoodenFish(0.65);
-                      setViewingScroll(scroll);
-                    }}
-                  >
-                    <div className="shelf-card-spine" />
-                    <div className="shelf-card-body">
-                      <div className="shelf-card-top">
-                        <div>
-                          <span className="shelf-scroll-tag">
-                            CỔ THƯ ĐÓNG CHỈ GÁY — BẤM ĐỂ MỞ ĐỌC
-                          </span>
-                          <h3>{scroll.title}</h3>
-                          <p className="shelf-motto">“{scroll.mottoText}”</p>
-                        </div>
-                        <WoodblockSealSvg
-                          topText="LÊN NÚI"
-                          middleText={`${scroll.totalDaysSpent} NGÀY`}
-                          bottomText="CHU SA ẤN"
-                          size={86}
-                        />
-                      </div>
-
-                      <div className="shelf-metrics-row">
-                        <span>
-                          Khổ luyện: <strong>{scroll.totalDaysSpent} ngày</strong>
-                        </span>
-                        <span>
-                          Thiền định Pomodoro: <strong>{scroll.totalPomodoroHours} giờ</strong>
-                        </span>
-                        <span>
-                          Vấp ngã gia hạn: <strong>{scroll.violationCount} lần</strong>
-                        </span>
-                        <span>
-                          Đắc đạo:{' '}
-                          <strong>{new Date(scroll.sealedAt).toLocaleDateString('vi-VN')}</strong>
-                        </span>
-                      </div>
-
-                      <div className="shelf-card-footer">
-                        <span className="seal-hash-code">ẤN CHỨNG: {scroll.sealHash}</span>
-                        <button type="button" className="zen-btn zen-btn-seal">
-                          <BookOpen size={15} />
-                          <span>Mở Cổ Thư Lật Trang & Xuất PDF</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* =====================================================================
-            MÔ-ĐUN 6: PHONG TỎA DESKTOP & WHITELIST (SECTION 4 & 6)
-           ===================================================================== */}
-        {activeTab === 'OS_LOCKDOWN' && (
-          <div className="module-section">
-            <div className="section-header-row">
-              <div>
-                <span className="zen-tag-red">
-                  MỤC 4 & 6 — PHONG TỎA HỆ THỐNG & KHÔNG GIAN TU LUYỆN
-                </span>
-                <h2 className="section-title">
-                  Hình Nền Tu Luyện Kép, Danh Sách Trắng Tuyệt Đối & Chế Tài Luật Núi
-                </h2>
-              </div>
-            </div>
-
-            {wallpaperStatusMsg && (
-              <div className="zen-alert-box alert-warning" style={{ marginBottom: 16 }}>
-                <Wallpaper size={18} />
-                <span>{wallpaperStatusMsg}</span>
-              </div>
-            )}
-
-            <div className="lockdown-two-col">
-              <div className="zen-card">
-                <h3>1. Bộ Đôi Hình Nền Tu Luyện Kép (Dual Ascent Wallpaper)</h3>
-                <div className="dual-wallpaper-previews" style={{ marginTop: 12 }}>
-                  <div className="wallpaper-preview-box">
-                    <img src="./assets/shanshui-mountains.jpg" alt="Lock Screen Mountains" />
-                    <div className="wp-caption">
-                      <strong>Ảnh ngoài (Màn hình khóa — Lock Screen)</strong>
-                      <span>Cảnh núi non hùng vĩ, hiểm trở ẩn hiện trong mây mù và gió núi</span>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                      <button
-                        type="button"
-                        className="zen-btn zen-btn-outline"
-                        onClick={() => setIsLockScreenOverlay(true)}
-                      >
-                        Xem Màn Hình Khóa
-                      </button>
-                      <button
-                        type="button"
-                        className="zen-btn zen-btn-seal"
-                        onClick={() => applyLiveWallpaperToOS('LOCK_MOUNTAIN')}
-                      >
-                        Đặt Làm Hình Nền Windows
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="wallpaper-preview-box">
-                    <img src="./assets/shanshui-monk-temple.jpg" alt="Home Screen Monk Temple" />
-                    <div className="wp-caption">
-                      <strong>Ảnh trong (Màn hình chính — Home Screen)</strong>
-                      <span>Nhà sư ngồi thiền định kiên định cùng ngôi chùa cổ trên đỉnh núi cao</span>
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                      <button
-                        type="button"
-                        className="zen-btn zen-btn-seal"
-                        onClick={() => applyLiveWallpaperToOS('HOME_TEMPLE')}
-                      >
-                        <Wallpaper size={15} />
-                        <span>Áp Dụng Hình Nền Nhà Sư + Tiến Độ Lên Windows</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', gap: 12, marginTop: 16, alignItems: 'center' }}>
-                  <button
-                    type="button"
-                    className="zen-btn zen-btn-outline"
-                    onClick={async () => {
-                      const res = await desktopBridge.restoreWindowsWallpaper();
-                      setWallpaperStatusMsg(
-                        res.ok
-                          ? `Đã khôi phục hình nền Windows gốc: ${res.restoredPath}`
-                          : `Thông báo: ${res.reason || 'Chưa có bản sao lưu hình nền mới.'}`
-                      );
-                    }}
-                  >
-                    <RotateCcw size={15} />
-                    <span>Khôi Phục Hình Nền Windows Gốc Ngay</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="zen-card">
-                <div
-                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                >
-                  <h3>2. Cơ Chế Danh Sách Trắng Tuyệt Đối (Strict Whitelist)</h3>
-                  <span className="zen-tag-red">
-                    {db.session.isMonkModeOn ? 'ĐÃ KHÓA THÊM MỚI' : 'CHO PHÉP KHAI BÁO'}
-                  </span>
-                </div>
-                <div className="whitelist-items-box" style={{ marginTop: 12 }}>
-                  {db.session.whitelistedApps.map((item) => (
-                    <div key={item.id} className="whitelist-row">
-                      <div>
-                        <strong>{item.name}</strong>
-                        <div style={{ fontSize: 12, color: '#B8B4A9' }}>
-                          Process: <code>{item.processName}</code>
-                        </div>
-                      </div>
-                      {!db.session.isMonkModeOn && item.category === 'DECLARED_WORK_TOOL' && (
-                        <button
-                          type="button"
-                          className="zen-btn zen-btn-ghost"
-                          onClick={() =>
-                            persistDb((prev) => ({
-                              ...prev,
-                              session: {
-                                ...prev.session,
-                                whitelistedApps: prev.session.whitelistedApps.filter(
-                                  (w) => w.id !== item.id
-                                ),
-                              },
-                            }))
-                          }
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-
-                {!db.session.isMonkModeOn && (
-                  <form
-                    style={{ display: 'flex', gap: 8, marginTop: 12 }}
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      if (!newWhitelistName.trim() || !newWhitelistProcess.trim()) return;
-                      persistDb((prev) => ({
-                        ...prev,
-                        session: {
-                          ...prev.session,
-                          whitelistedApps: [
-                            ...prev.session.whitelistedApps,
-                            {
-                              id: `wl-${Date.now()}`,
-                              name: newWhitelistName.trim(),
-                              processName: newWhitelistProcess.trim(),
-                              category: 'DECLARED_WORK_TOOL',
-                            },
-                          ],
-                        },
-                      }));
-                      setNewWhitelistName('');
-                      setNewWhitelistProcess('');
-                    }}
-                  >
-                    <input
-                      type="text"
-                      className="zen-input"
-                      style={{ flex: 1 }}
-                      placeholder="Tên công cụ Công việc..."
-                      value={newWhitelistName}
-                      onChange={(e) => setNewWhitelistName(e.target.value)}
-                    />
-                    <input
-                      type="text"
-                      className="zen-input"
-                      style={{ width: 140 }}
-                      placeholder="Process (VD: Code)"
-                      value={newWhitelistProcess}
-                      onChange={(e) => setNewWhitelistProcess(e.target.value)}
-                    />
-                    <button type="submit" className="zen-btn zen-btn-seal">
-                      <Plus size={15} /> Thêm
-                    </button>
-                  </form>
-                )}
-
-                {runningApps.length > 0 && (
-                  <div style={{ marginTop: 12 }}>
-                    <span style={{ fontSize: 12, color: '#B8B4A9' }}>
-                      Tiến trình đang mở trên máy:
-                    </span>
-                    <div className="running-procs-chips">
-                      {runningApps.slice(0, 8).map((proc) => (
-                        <button
-                          key={proc.Id}
-                          type="button"
-                          className="proc-chip"
-                          disabled={db.session.isMonkModeOn}
-                          onClick={() => {
-                            setNewWhitelistName(
-                              proc.MainWindowTitle.slice(0, 32) || proc.ProcessName
-                            );
-                            setNewWhitelistProcess(proc.ProcessName);
-                          }}
-                        >
-                          + {proc.ProcessName}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+            onRequestEditStrike={handleRequestEditStrike}
+            onRequestDeleteStrike={handleRequestDeleteStrike}
+            onLaunchConquerCeremony={handleLaunchConquerMountainCeremony}
+            onZoomPhoto={setZoomedHistoryPhoto}
+            onPlayWoodenFish={(v) => soundEngine.playWoodenFish(v)}
+            onPlayWoodblockStamp={() => soundEngine.playWoodblockStampSound()}
+            onShowMessage={showSternMessage}
+            onRequestDeleteRitualGroup={(group) =>
+              setConfirmDeleteTarget({
+                kind: 'RITUAL_GROUP',
+                id: group.id,
+                title: group.title,
+                itemCount: group.items.length,
+              })
+            }
+            onDragStartRitualItem={handleDragStartRitualItem}
+            onDragOverRitualItem={handleDragOverRitualItem}
+            onDropRitualItem={handleDropRitualItem}
+            onDragEndRitualItem={handleDragEndRitualItem}
+            onMoveRitualItem={handleMoveRitualItem}
+          />
         )}
       </main>
 
-      {/* DEVELOPER & SIMULATION BAR */}
-      {devBarVisible && (
-        <footer className="dev-simulation-bar">
-          <div className="dev-bar-label">
-            <Sliders size={15} color="#9E2A2B" />
-            <strong>BẢNG GIẢ LẬP & KIỂM THỬ NHANH (DEV BAR):</strong>
-          </div>
-
-          <div className="dev-bar-buttons">
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={() => setSimulatedTimeOffsetMs((prev) => prev + 86400000)}
-            >
-              +1 Ngày
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={() => {
-                setForceOpenReflectionWindow((v) => !v);
-                setActiveTab('REFLECTION');
-              }}
-            >
-              {forceOpenReflectionWindow ? 'Tắt Giả Lập 21:00' : 'Mở Cổng Tự Vấn 21:00'}
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={() =>
-                setNaggingAlert({
-                  level: 2,
-                  targetId: db.dailyStrikes[0]?.id || 'strike-1',
-                  targetType: 'STRIKE',
-                  title:
-                    db.dailyStrikes[0]?.title ||
-                    'Hoàn thiện bộ kiểm duyệt Bằng chứng Xác thực (Proof of Work)',
-                  scheduledWindow: '14:00 (Trễ 5 phút)',
-                  requiredPomodoroMins: 25,
-                })
-              }
-            >
-              Test Báo Động Cấp 2 (Full-Screen Hijack)
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={() =>
-                triggerMountainLawViolation(
-                  'MANUAL_SIMULATION',
-                  'Giả lập vi phạm Luật Núi (Bỏ lỡ Nghi thức / Không hoàn thành Công phá trước 23:59)'
-                )
-              }
-            >
-              Test Phạt Luật Núi (Reset Streak = 0)
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={() => {
-                persistDb((prev) => ({
-                  ...prev,
-                  session: {
-                    ...prev.session,
-                    isMonkModeOn: true,
-                    currentTargetEndTime: effectiveNow - 3600000,
-                  },
-                  peakGoals: prev.peakGoals.map((g) => ({
-                    ...g,
-                    progressPct: 85,
-                    currentMetric: Math.round(0.85 * g.targetMetric),
-                    isCompleted: false,
-                  })),
-                }));
-                showSternMessage(
-                  'ĐÃ KÍCH HOẠT GIẢ LẬP QUÁ GIỜ (OVERTIME LOCK — 85%)',
-                  'Thời gian lên núi đã hết nhưng tiến độ Đỉnh Núi mới đạt 85%. Hãy thử bấm vào nút Monk Mode ở góc trên bên phải để kiểm chứng hệ thống từ chối mở khóa!',
-                  'info'
-                );
-              }}
-            >
-              Test Quá Giờ (Overtime Lock 85%)
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn dev-sim-btn-highlight"
-              onClick={() => {
-                soundEngine.playTempleBell(0.9);
-                persistDb((prev) => ({
-                  ...prev,
-                  session: {
-                    ...prev.session,
-                    isMonkModeOn: true,
-                    currentTargetEndTime: effectiveNow - 1000,
-                  },
-                  peakGoals: prev.peakGoals.map((g) => ({
-                    ...g,
-                    progressPct: 100,
-                    currentMetric: g.targetMetric,
-                    isCompleted: true,
-                  })),
-                  dailyStrikes: prev.dailyStrikes.map((s) => ({
-                    ...s,
-                    status: 'COMPLETED',
-                    completedPomodoroMins: s.requiredPomodoroMins,
-                    proofPhotoUri: s.proofPhotoUri || './assets/shanshui-monk-temple.jpg',
-                  })),
-                }));
-                showSternMessage(
-                  'ĐÃ ĐẠT 100% THỜI GIAN & 100% ĐỈNH NÚI!',
-                  'Cả 2 điều kiện Khóa Kép (Dual-Lock) đã thỏa mãn. Hãy bấm nút màu đỏ "ĐẮC ĐẠO XUỐNG NÚI (MỞ KHÓA)" ở góc phải trên cùng để kích hoạt Nghi thức Đóng Dấu Mộc Đỏ Chu Sa!',
-                  'seal'
-                );
-              }}
-            >
-              <Award size={14} />
-              <span>Giả lập Viên Mãn 100% (Đóng Dấu Bí Kíp)</span>
-            </button>
-
-            <button
-              type="button"
-              className="dev-sim-btn"
-              onClick={async () => {
-                persistDb((prev) => ({
-                  ...prev,
-                  session: { ...prev.session, isMonkModeOn: false },
-                }));
-                setNaggingAlert(null);
-                await desktopBridge.restoreWindowsWallpaper();
-                showSternMessage(
-                  'KHẨN CẤP MỞ KHÓA DEVELOPER (Ctrl+Shift+Alt+M)',
-                  'Đã tắt Monk Mode và khôi phục hình nền gốc.',
-                  'info'
-                );
-              }}
-            >
-              Tắt Khóa Khẩn Cấp (Ctrl+Shift+Alt+M)
-            </button>
-          </div>
-        </footer>
-      )}
-
-      {/* Focus Timer Lock Modal (Pomodoro) */}
-      <PomodoroLockModal
-        isOpen={Boolean(activePomodoro)}
-        taskTitle={activePomodoro?.title || ''}
-        taskTypeLabel={
-          activePomodoro?.type === 'RITUAL'
-            ? 'NGHI THỨC HÀNG NGÀY (RITUAL / HABIT TRACKER)'
-            : 'NHIỆM VỤ CÔNG PHÁ (DAILY STRIKE / TODO LIST)'
-        }
-        requiredMins={activePomodoro?.requiredMins || 25}
-        isMonkModeOn={db.session.isMonkModeOn}
-        devModeEnabled={true}
-        onCompletePomodoro={handlePomodoroFinished}
-        onCancelOrAbandon={(reason) => {
-          setActivePomodoro(null);
-          showSternMessage('PHIÊN POMODORO ĐÃ BỊ HỦY BỎ', reason, 'danger');
+      {/* GLOBAL MODALS */}
+      <AppModals
+        db={db}
+        todayStr={todayStr}
+        timeLeftTodayLabel={timeLeftToday.label}
+        todayLawPreview={todayLawPreview}
+        remainingTaskMods={remainingTaskMods}
+        maxDailyTaskMods={maxDailyTaskMods}
+        goalModalOpen={goalModalOpen}
+        editingGoalId={editingGoalId}
+        goalTitleDraft={goalTitleDraft}
+        goalCategoryDraft={goalCategoryDraft}
+        goalDescDraft={goalDescDraft}
+        goalVowDraft={goalVowDraft}
+        goalHasDeadlineDraft={goalHasDeadlineDraft}
+        goalTargetDateDraft={goalTargetDateDraft}
+        goalMilestonesDraft={goalMilestonesDraft}
+        newMilestoneText={newMilestoneText}
+        onCloseGoalModal={() => setGoalModalOpen(false)}
+        onSaveGoalModal={handleSaveGoalModal}
+        onChangeGoalTitle={setGoalTitleDraft}
+        onChangeGoalCategory={setGoalCategoryDraft}
+        onChangeGoalDesc={setGoalDescDraft}
+        onChangeGoalVow={setGoalVowDraft}
+        onChangeGoalHasDeadline={setGoalHasDeadlineDraft}
+        onChangeGoalTargetDate={setGoalTargetDateDraft}
+        onChangeGoalMilestones={setGoalMilestonesDraft}
+        onChangeNewMilestoneText={setNewMilestoneText}
+        confirmDeleteTarget={confirmDeleteTarget}
+        onCancelDeleteTarget={() => setConfirmDeleteTarget(null)}
+        onConfirmDeleteTarget={handleConfirmDeleteTarget}
+        violationModalOpen={violationModalOpen}
+        lawVerdict={lawVerdict}
+        onCloseViolationModal={() => {
+          setViolationModalOpen(false);
+          setLawVerdict(null);
         }}
-      />
-
-      {/* Live Proof of Work Modal */}
-      <LiveProofModal
-        isOpen={Boolean(activeProof)}
-        taskTitle={activeProof?.title || ''}
+        onGoToLawsTab={() => {
+          setViolationModalOpen(false);
+          setLawVerdict(null);
+          setFocusedStrikeId(null);
+          setSelectedGoalId(null);
+          setOuterTab('LAWS');
+        }}
+        onRunLawEvaluationTodayNow={handleRunLawEvaluationTodayNow}
+        proofModalTarget={proofModalTarget}
         onConfirmProof={handleProofConfirmed}
-        onCancel={() => setActiveProof(null)}
+        onCancelProof={() => setProofModalTarget(null)}
+        viewingScroll={viewingScroll}
+        ceremonyScroll={ceremonyScroll}
+        onFinishCeremony={handleFinishConquerCeremony}
+        onCloseScrollViewer={() => {
+          setViewingScroll(null);
+          setCeremonyScroll(null);
+        }}
+        onExportedScrollPdf={(scrollId, pdfPath) => {
+          persistDb((prev) => ({
+            ...prev,
+            sacredScrolls: prev.sacredScrolls.map((s) =>
+              s.id === scrollId ? { ...s, exportedPdfUri: pdfPath } : s
+            ),
+          }));
+        }}
+        zoomedHistoryPhoto={zoomedHistoryPhoto}
+        onCloseZoomedPhoto={() => setZoomedHistoryPhoto(null)}
+        strikeBeingEdited={strikeBeingEdited}
+        editStrikeTitle={editStrikeTitle}
+        editStrikePomo={editStrikePomo}
+        editStrikeActivityType={editStrikeActivityType}
+        editStrikeRequiresPhoto={editStrikeRequiresPhoto}
+        onChangeEditStrikeTitle={setEditStrikeTitle}
+        onChangeEditStrikePomo={setEditStrikePomo}
+        onChangeEditStrikeActivityType={setEditStrikeActivityType}
+        onToggleEditStrikeRequiresPhoto={() => setEditStrikeRequiresPhoto((v) => !v)}
+        onCloseEditStrike={() => setStrikeBeingEdited(null)}
+        onConfirmEditStrike={handleConfirmEditStrike}
+        strikeBeingDeleted={strikeBeingDeleted}
+        onCloseDeleteStrike={() => setStrikeBeingDeleted(null)}
+        onConfirmDeleteStrike={handleConfirmDeleteStrike}
+        showQuotaExhaustedModal={showQuotaExhaustedModal}
+        onCloseQuotaExhaustedModal={() => setShowQuotaExhaustedModal(false)}
       />
 
-      {/* Sacred Scroll Viewer / Descending Mountain Ceremony Modal */}
-      {(viewingScroll || ceremonyScroll) && (
-        <SacredScrollBookViewer
-          scroll={(ceremonyScroll || viewingScroll)!}
-          isCeremonyMode={Boolean(ceremonyScroll)}
-          onFinishCeremony={handleFinishDescendCeremony}
-          onClose={() => {
-            setViewingScroll(null);
-            setCeremonyScroll(null);
-          }}
-          onExportedPdf={(scrollId, pdfPath) => {
-            persistDb((prev) => ({
-              ...prev,
-              sacredScrolls: prev.sacredScrolls.map((s) =>
-                s.id === scrollId ? { ...s, exportedPdfUri: pdfPath } : s
-              ),
-            }));
-          }}
-        />
-      )}
+      <QuickCommandPalette
+        isOpen={commandPaletteOpen}
+        db={db}
+        onClose={() => setCommandPaletteOpen(false)}
+        onSelectOuterTab={(tab) => {
+          setFocusedStrikeId(null);
+          setSelectedGoalId(null);
+          setOuterTab(tab);
+        }}
+        onSelectGoal={(goalId) => {
+          soundEngine.playWoodenFish(0.6);
+          setFocusedStrikeId(null);
+          setSelectedGoalId(goalId);
+          setInnerTab('DAILY_STRIKES');
+        }}
+        onEnterFocusStrike={(strike) => enterFocusModeForStrike(strike, false)}
+      />
     </div>
   );
 };

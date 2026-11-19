@@ -7,7 +7,7 @@ import { ProofAnalysisResult } from '../types/models';
  */
 export async function inspectImageProof(
   dataUrl: string,
-  source: 'WEBCAM' | 'SCREEN'
+  source: 'UPLOAD' | 'CLIPBOARD' | 'WEBCAM' | 'SCREEN' = 'UPLOAD'
 ): Promise<ProofAnalysisResult> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -84,7 +84,9 @@ export async function inspectImageProof(
       const variance = lapSqSum / count - meanLap * meanLap;
       const sharpness = Number(Math.sqrt(Math.max(0, variance)).toFixed(1));
 
-      if (brightness < 18) {
+      const isDirectUpload = source === 'UPLOAD' || source === 'CLIPBOARD';
+
+      if (!isDirectUpload && brightness < 18) {
         resolve({
           brightness,
           sharpness,
@@ -97,7 +99,7 @@ export async function inspectImageProof(
         return;
       }
 
-      if (brightness > 248) {
+      if (!isDirectUpload && brightness > 248) {
         resolve({
           brightness,
           sharpness,
@@ -110,7 +112,7 @@ export async function inspectImageProof(
         return;
       }
 
-      if (sharpness < 6.5 || entropy < 1.35) {
+      if (!isDirectUpload && (sharpness < 6.5 || entropy < 1.35)) {
         resolve({
           brightness,
           sharpness,
@@ -189,14 +191,14 @@ export async function stampProofPhoto(
       ctx.save();
       ctx.translate(canvas.width - 110, canvas.height - 105);
       ctx.rotate(-0.12);
-      ctx.strokeStyle = '#9E2A2B';
+      ctx.strokeStyle = '#2F6B57';
       ctx.lineWidth = 4;
-      ctx.fillStyle = 'rgba(158, 42, 43, 0.16)';
+      ctx.fillStyle = 'rgba(62, 138, 114, 0.16)';
       ctx.fillRect(0, 0, 88, 88);
       ctx.strokeRect(0, 0, 88, 88);
       ctx.strokeRect(5, 5, 78, 78);
 
-      ctx.fillStyle = '#9E2A2B';
+      ctx.fillStyle = '#2F6B57';
       ctx.font = 'bold 14px "Noto Serif", serif';
       ctx.textAlign = 'center';
       ctx.fillText('LÊN NÚI', 44, 28);
@@ -365,7 +367,7 @@ export async function renderMonkDesktopWallpaper(params: {
   // Subtle dark ink vignette at top-left for the Zen HUD overlay
   ctx.fillStyle = 'rgba(18, 19, 20, 0.86)';
   ctx.fillRect(64, 64, 680, 320);
-  ctx.strokeStyle = '#9E2A2B';
+  ctx.strokeStyle = '#2F6B57';
   ctx.lineWidth = 2;
   ctx.strokeRect(64, 64, 680, 320);
   ctx.strokeStyle = 'rgba(246, 244, 238, 0.25)';
@@ -373,7 +375,7 @@ export async function renderMonkDesktopWallpaper(params: {
   ctx.strokeRect(72, 72, 664, 304);
 
   // Header Badge
-  ctx.fillStyle = '#9E2A2B';
+  ctx.fillStyle = '#2F6B57';
   ctx.fillRect(92, 94, 180, 28);
   ctx.fillStyle = '#F6F4EE';
   ctx.font = 'bold 13px "JetBrains Mono", monospace';
@@ -407,17 +409,17 @@ export async function renderMonkDesktopWallpaper(params: {
 
   ctx.fillStyle = 'rgba(246, 244, 238, 0.14)';
   ctx.fillRect(92, 324, 500, 16);
-  ctx.fillStyle = '#9E2A2B';
+  ctx.fillStyle = '#2F6B57';
   ctx.fillRect(92, 324, Math.max(4, (500 * Math.min(100, params.progressPct)) / 100), 16);
 
   // Red Cinnabar Stamp on the right of the card
   ctx.save();
   ctx.translate(625, 245);
-  ctx.strokeStyle = '#9E2A2B';
+  ctx.strokeStyle = '#2F6B57';
   ctx.lineWidth = 3;
   ctx.strokeRect(0, 0, 86, 86);
   ctx.strokeRect(5, 5, 76, 76);
-  ctx.fillStyle = '#9E2A2B';
+  ctx.fillStyle = '#2F6B57';
   ctx.font = 'bold 16px "Noto Serif", serif';
   ctx.textAlign = 'center';
   ctx.fillText('TỊNH', 43, 34);

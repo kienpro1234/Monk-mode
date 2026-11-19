@@ -1,8 +1,15 @@
 // Web Audio API Synthesized Temple & Zen Sound Engine (100% Offline, STREAM_ALARM Override Style)
 
+export type AmbientSoundMode = 'OFF' | 'RAIN' | 'STREAM' | 'FIRE';
+
 class ZenSoundEngine {
   private ctx: AudioContext | null = null;
   private alarmInterval: number | null = null;
+  private ambientMode: AmbientSoundMode = 'OFF';
+  private ambientVolume = 0.35;
+  private ambientSource: AudioBufferSourceNode | null = null;
+  private ambientGain: GainNode | null = null;
+  private ambientCrackleTimer: number | null = null;
 
   private getContext(): AudioContext {
     if (!this.ctx || this.ctx.state === 'closed') {
@@ -209,6 +216,141 @@ class ZenSoundEngine {
     if (this.alarmInterval !== null) {
       clearInterval(this.alarmInterval);
       this.alarmInterval = null;
+    }
+  }
+
+  public getAmbientMode(): AmbientSoundMode {
+    return this.ambientMode;
+  }
+
+  public setAmbientVolume(volume: number) {
+    this.ambientVolume = Math.max(0.05, Math.min(1, volume));
+    if (this.ambientGain && this.ctx) {
+      this.ambientGain.gain.setTargetAtTime(this.ambientVolume * 0.4, this.ctx.currentTime, 0.08);
+    }
+  }
+
+  public stopAmbientSound() {
+    this.ambientMode = 'OFF';
+    if (this.ambientCrackleTimer !== null) {
+      clearInterval(this.ambientCrackleTimer);
+      this.ambientCrackleTimer = null;
+    }
+    if (this.ambientSource) {
+      try {
+        this.ambientSource.stop();
+        this.ambientSource.disconnect();
+      } catch {
+        // Ignore already stopped source
+      }
+      this.ambientSource = null;
+    }
+    if (this.ambientGain) {
+      try {
+        this.ambientGain.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.ambientGain = null;
+    }
+  }
+
+  /**
+   * Âm Thanh Nền Tập Trung Ngoại Tuyến 100% (Mưa rơi / Suối chảy / Lò sưởi)
+   */
+  public setAmbientSound(mode: AmbientSoundMode, volume?: number) {
+    if (typeof volume === 'number') {
+      this.ambientVolume = Math.max(0.05, Math.min(1, volume));
+    }
+    this.stopAmbientSound();
+    if (mode === 'OFF') return;
+
+    try {
+      const ctx = this.getContext();
+      this.ambientMode = mode;
+
+      // 3-second seamless noise buffer
+      const length = ctx.sampleRate * 3;
+      const buf = ctx.createBuffer(1, length, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      let lastOut = 0;
+      for (let i = 0; i < length; i++) {
+        const white = Math.random() * 2 - 1;
+        if (mode === 'STREAM' || mode === 'FIRE') {
+          // Smooth brown-ish noise for warm stream or hearth rumble
+          lastOut = (lastOut + 0.025 * white) / 1.025;
+          data[i] = lastOut * 3.2;
+        } else {
+          // Pink-tinted white noise for rain drops
+          lastOut = 0.85 * lastOut + 0.15 * white;
+          data[i] = lastOut * 1.8;
+        }
+      }
+
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+
+      const masterGain = ctx.createGain();
+      masterGain.gain.setValueAtTime(this.ambientVolume * 0.4, ctx.currentTime);
+
+      if (mode === 'RAIN') {
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 500;
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 3200;
+        src.connect(hp);
+        hp.connect(lp);
+        lp.connect(masterGain);
+      } else if (mode === 'STREAM') {
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'lowpass';
+        bp.frequency.value = 950;
+        src.connect(bp);
+        bp.connect(masterGain);
+      } else {
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 460;
+        src.connect(lp);
+        lp.connect(masterGain);
+
+        // Gentle soft fire crackle ticks
+        this.ambientCrackleTimer = window.setInterval(() => {
+          if (this.ambientMode !== 'FIRE' || !this.ctx) return;
+          if (Math.random() > 0.45) return;
+          try {
+            const cLen = Math.floor(ctx.sampleRate * 0.025);
+            const cBuf = ctx.createBuffer(1, cLen, ctx.sampleRate);
+            const cData = cBuf.getChannelData(0);
+            for (let j = 0; j < cLen; j++) {
+              cData[j] = (Math.random() * 2 - 1) * Math.exp(-j / (ctx.sampleRate * 0.004));
+            }
+            const cSrc = ctx.createBufferSource();
+            cSrc.buffer = cBuf;
+            const cBand = ctx.createBiquadFilter();
+            cBand.type = 'bandpass';
+            cBand.frequency.value = 2200 + Math.random() * 1400;
+            const cGain = ctx.createGain();
+            cGain.gain.setValueAtTime(this.ambientVolume * 0.22, ctx.currentTime);
+            cSrc.connect(cBand);
+            cBand.connect(cGain);
+            cGain.connect(ctx.destination);
+            cSrc.start(ctx.currentTime);
+          } catch {
+            // Ignore crackle tick error
+          }
+        }, 420);
+      }
+
+      masterGain.connect(ctx.destination);
+      src.start();
+      this.ambientSource = src;
+      this.ambientGain = masterGain;
+    } catch {
+      this.ambientMode = 'OFF';
     }
   }
 }

@@ -3,6 +3,7 @@ import React, { useEffect, useRef } from 'react';
 interface ShanshuiCanvasBgProps {
   isMonkModeOn: boolean;
   isLockScreenView?: boolean;
+  reduceMotion?: boolean;
 }
 
 /**
@@ -12,6 +13,7 @@ interface ShanshuiCanvasBgProps {
 export const ShanshuiCanvasBg: React.FC<ShanshuiCanvasBgProps> = ({
   isMonkModeOn,
   isLockScreenView = false,
+  reduceMotion = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -21,7 +23,12 @@ export const ShanshuiCanvasBg: React.FC<ShanshuiCanvasBgProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let animId: number;
+    if (reduceMotion) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    let animId: number | null = null;
     let width = (canvas.width = window.innerWidth);
     let height = (canvas.height = window.innerHeight);
 
@@ -52,63 +59,85 @@ export const ShanshuiCanvasBg: React.FC<ShanshuiCanvasBgProps> = ({
       alpha: 0.12 + Math.random() * 0.28,
     }));
 
-    const render = () => {
-      ctx.clearRect(0, 0, width, height);
-
-      // Draw drifting mountain mist
-      for (const mist of mistLayers) {
-        mist.x += mist.speed;
-        if (mist.x - mist.radiusX > width) mist.x = -mist.radiusX;
-        if (mist.x + mist.radiusX < 0) mist.x = width + mist.radiusX;
-
-        const grad = ctx.createRadialGradient(
-          mist.x,
-          mist.y,
-          10,
-          mist.x,
-          mist.y,
-          mist.radiusX
-        );
-        const mistColor = isMonkModeOn ? '246, 244, 238' : '225, 220, 210';
-        grad.addColorStop(0, `rgba(${mistColor}, ${mist.alpha})`);
-        grad.addColorStop(1, `rgba(${mistColor}, 0)`);
-
-        ctx.save();
-        ctx.translate(mist.x, mist.y);
-        ctx.scale(1, mist.radiusY / mist.radiusX);
-        ctx.beginPath();
-        ctx.arc(0, 0, mist.radiusX, 0, Math.PI * 2);
-        ctx.restore();
-        ctx.fillStyle = grad;
-        ctx.fill();
+    let lastFrameMs = 0;
+    const render = (ts: number = 0) => {
+      if (document.hidden) {
+        animId = null;
+        return;
       }
+      if (ts - lastFrameMs >= 35) {
+        lastFrameMs = ts;
+        ctx.clearRect(0, 0, width, height);
 
-      // Draw drifting mountain wind / ink particles
-      for (const m of motes) {
-        m.x += m.vx;
-        m.y += m.vy;
-        if (m.x > width) m.x = 0;
-        if (m.y > height) m.y = 0;
-        if (m.y < 0) m.y = height;
+        // Draw drifting mountain mist
+        for (const mist of mistLayers) {
+          mist.x += mist.speed;
+          if (mist.x - mist.radiusX > width) mist.x = -mist.radiusX;
+          if (mist.x + mist.radiusX < 0) mist.x = width + mist.radiusX;
 
-        ctx.beginPath();
-        ctx.arc(m.x, m.y, m.r, 0, Math.PI * 2);
-        ctx.fillStyle = isMonkModeOn
-          ? `rgba(246, 244, 238, ${m.alpha})`
-          : `rgba(28, 29, 31, ${m.alpha * 0.7})`;
-        ctx.fill();
+          const grad = ctx.createRadialGradient(
+            mist.x,
+            mist.y,
+            10,
+            mist.x,
+            mist.y,
+            mist.radiusX
+          );
+          const mistColor = isMonkModeOn ? '246, 244, 238' : '225, 220, 210';
+          grad.addColorStop(0, `rgba(${mistColor}, ${mist.alpha})`);
+          grad.addColorStop(1, `rgba(${mistColor}, 0)`);
+
+          ctx.save();
+          ctx.translate(mist.x, mist.y);
+          ctx.scale(1, mist.radiusY / mist.radiusX);
+          ctx.beginPath();
+          ctx.arc(0, 0, mist.radiusX, 0, Math.PI * 2);
+          ctx.restore();
+          ctx.fillStyle = grad;
+          ctx.fill();
+        }
+
+        // Draw drifting mountain wind / ink particles
+        for (const m of motes) {
+          m.x += m.vx;
+          m.y += m.vy;
+          if (m.x > width) m.x = 0;
+          if (m.y > height) m.y = 0;
+          if (m.y < 0) m.y = height;
+
+          ctx.beginPath();
+          ctx.arc(m.x, m.y, m.r, 0, Math.PI * 2);
+          ctx.fillStyle = isMonkModeOn
+            ? `rgba(246, 244, 238, ${m.alpha})`
+            : `rgba(28, 29, 31, ${m.alpha * 0.7})`;
+          ctx.fill();
+        }
       }
 
       animId = requestAnimationFrame(render);
     };
 
-    render();
+    const handleVisibilityChange = () => {
+      if (!document.hidden && animId === null) {
+        lastFrameMs = 0;
+        animId = requestAnimationFrame(render);
+      } else if (document.hidden && animId !== null) {
+        cancelAnimationFrame(animId);
+        animId = null;
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    if (!document.hidden) {
+      animId = requestAnimationFrame(render);
+    }
 
     return () => {
-      cancelAnimationFrame(animId);
+      if (animId !== null) cancelAnimationFrame(animId);
       window.removeEventListener('resize', handleResize);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isMonkModeOn, isLockScreenView]);
+  }, [isMonkModeOn, isLockScreenView, reduceMotion]);
 
   const bgImage = isLockScreenView
     ? './assets/shanshui-mountains.jpg'
