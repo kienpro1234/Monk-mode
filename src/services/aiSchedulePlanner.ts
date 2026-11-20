@@ -150,6 +150,14 @@ export function parseTimeToMins(timeStr: string, fallbackMins: number = 0): numb
   return Math.max(0, Math.min(1440, Math.round(h * 60 + m)));
 }
 
+export function formatDurationHM(mins: number): string {
+  const m = Math.max(0, Math.round(mins || 0));
+  if (m < 60) return `${m}p`;
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  return r === 0 ? `${h}h` : `${h}h${String(r).padStart(2, '0')}p`;
+}
+
 export function formatMinsToTime(totalMins: number): string {
   const clamped = Math.max(0, Math.min(1440, Math.round(totalMins)));
   if (clamped === 1440) return '24:00';

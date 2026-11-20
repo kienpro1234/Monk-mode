@@ -54,6 +54,7 @@ import { createInitialDatabase, getTodayDateStr } from './services/defaultData';
 import { AmbientSoundMode, soundEngine } from './utils/soundEngine';
 import { ShanshuiCanvasBg } from './components/ShanshuiCanvasBg';
 import { QuickCommandPalette } from './components/QuickCommandPalette';
+import { formatDurationHM } from './components/DurationHMInput';
 import {
   LawEvaluationResult,
   evaluateDayImmediately,
@@ -146,14 +147,28 @@ export const App: React.FC = () => {
   const [innerTab, setInnerTab] = useState<InnerGoalTab>('DAILY_STRIKES');
   const [focusedStrikeId, setFocusedStrikeId] = useState<string | null>(null);
 
-  // Drift-Free Timestamp-Anchored Pomodoro Timer State
+  // Drift-Free Timestamp-Anchored Pomodoro & Flowtime 2.0 State
+  const [timerMode, setTimerMode] = useState<'POMODORO' | 'FLOWTIME'>('POMODORO');
+  const timerModeRef = useRef<'POMODORO' | 'FLOWTIME'>('POMODORO');
+  timerModeRef.current = timerMode;
+  const [allowFlowOvertime, setAllowFlowOvertime] = useState<boolean>(true);
+  const allowFlowOvertimeRef = useRef<boolean>(true);
+  allowFlowOvertimeRef.current = allowFlowOvertime;
   const [pomoSecondsLeft, setPomoSecondsLeft] = useState<number>(25 * 60);
   const [pomoTotalSeconds, setPomoTotalSeconds] = useState<number>(25 * 60);
   const [pomoRunning, setPomoRunning] = useState<boolean>(false);
+  const [overtimeSeconds, setOvertimeSeconds] = useState<number>(0);
+  const [flowElapsedSeconds, setFlowElapsedSeconds] = useState<number>(0);
   const pomoStartMinsRef = useRef<number>(25);
   const pomoEndTimeMsRef = useRef<number | null>(null);
   const pomoSecondsLeftRef = useRef<number>(25 * 60);
   const pomoCompletedGuardRef = useRef<boolean>(false);
+  const overtimeStartMsRef = useRef<number | null>(null);
+  const overtimeBaseSecsRef = useRef<number>(0);
+  const flowStartMsRef = useRef<number | null>(null);
+  const flowAccumulatedSecsRef = useRef<number>(0);
+  const handleTogglePomoRunRef = useRef<() => void>(() => {});
+  const lastTrayPomoSyncAtRef = useRef<number>(0);
 
   // Clock ticker
   const [nowTick, setNowTick] = useState(Date.now());
@@ -296,24 +311,52 @@ export const App: React.FC = () => {
     desktopBridge.getAutoStartStatus().then(setAutoStartStatus);
   }, [announceLawVerdict]);
 
-  // Background Daemon Sync & Heartbeat
+  // Background Daemon Sync & Heartbeat (including Tray Work-Return & Tray Pomodoro controls)
   useEffect(() => {
     if (!dbLoaded) return;
     const syncDaemon = async () => {
       const hbRes = await desktopBridge.pingHeartbeat();
       const status = await desktopBridge.getDaemonStatus();
       if (status.ok) setDaemonStatus(status);
-      if (hbRes.evaluated) {
+
+      const prevWorkRecord = dbRef.current.dailyWorkShiftLogs?.[
+        getShiftDateStr(
+          Date.now(),
+          getLawConfig(dbRef.current).workShiftMode,
+          getEffectiveNightStartTime(getLawConfig(dbRef.current))
+        )
+      ];
+      if (hbRes.evaluated || (!prevWorkRecord && status.workShiftConfirmed)) {
         const latest = await desktopBridge.fetchServerDatabase();
         if (latest && latest.session) {
-          setDb(latest);
+          const latestCfg = getLawConfig(latest);
+          const curShiftDate = getShiftDateStr(
+            Date.now(),
+            latestCfg.workShiftMode,
+            getEffectiveNightStartTime(latestCfg)
+          );
+          const newlyConfirmed = Boolean(!prevWorkRecord && latest.dailyWorkShiftLogs?.[curShiftDate]);
+          if (hbRes.evaluated || newlyConfirmed) {
+            setDb(latest);
+          }
+          if (newlyConfirmed) {
+            soundEngine.playWoodblockStampSound();
+            showSternMessage(
+              '🏠 ĐÃ ĐỒNG BỘ CHẤM CÔNG TỪ KHAY HỆ THỐNG',
+              'Giờ đi làm hôm nay vừa được chốt từ khay hệ thống Windows & cập nhật Quỹ Thời Gian 24h.',
+              'seal'
+            );
+          }
           if (latest.session.pendingOfflineReport?.missedDeadlineWhileOffline) {
             soundEngine.playViolationGong();
           }
         }
       }
+      if (hbRes.pendingTrayAction?.type === 'TOGGLE_POMO') {
+        handleTogglePomoRunRef.current();
+      }
     };
-    const interval = window.setInterval(syncDaemon, 20000);
+    const interval = window.setInterval(syncDaemon, 10000);
     const onFocus = () => {
       syncDaemon();
     };
@@ -322,7 +365,7 @@ export const App: React.FC = () => {
       window.clearInterval(interval);
       window.removeEventListener('focus', onFocus);
     };
-  }, [dbLoaded]);
+  }, [dbLoaded, showSternMessage]);
 
   // 15s Clock Ticker (prevents idle 1s full-app re-renders while Pomodoro uses its own dedicated loop)
   useEffect(() => {
@@ -936,6 +979,30 @@ export const App: React.FC = () => {
     return pomoSecondsLeftRef.current;
   }, [pomoRunning]);
 
+  const getLiveOvertimeSeconds = useCallback(() => {
+    if (timerModeRef.current !== 'POMODORO') return 0;
+    if (pomoRunning && overtimeStartMsRef.current !== null) {
+      return (
+        overtimeBaseSecsRef.current +
+        Math.max(0, Math.floor((Date.now() - overtimeStartMsRef.current) / 1000))
+      );
+    }
+    return overtimeBaseSecsRef.current;
+  }, [pomoRunning]);
+
+  const getLiveElapsedSeconds = useCallback(() => {
+    if (timerModeRef.current === 'FLOWTIME') {
+      if (pomoRunning && flowStartMsRef.current !== null) {
+        return (
+          flowAccumulatedSecsRef.current +
+          Math.max(0, Math.floor((Date.now() - flowStartMsRef.current) / 1000))
+        );
+      }
+      return flowAccumulatedSecsRef.current;
+    }
+    return Math.max(0, pomoTotalSeconds - getLiveRemainingSeconds()) + getLiveOvertimeSeconds();
+  }, [pomoRunning, pomoTotalSeconds, getLiveRemainingSeconds, getLiveOvertimeSeconds]);
+
   // Enter Single-Task Focus Mode (restoring saved paused state if present)
   const enterFocusModeForStrike = useCallback(
     (strike: DailyStrikeTodoEntity, autoStart: boolean = false) => {
@@ -951,6 +1018,15 @@ export const App: React.FC = () => {
         : Math.max(5, strike.requiredPomodoroMins || 25);
       const totalSecs = hasSavedPause ? strike.savedPomoTotalSeconds! : mins * 60;
       const leftSecs = hasSavedPause ? strike.savedPomoSecondsLeft! : totalSecs;
+
+      overtimeStartMsRef.current = null;
+      overtimeBaseSecsRef.current = 0;
+      flowStartMsRef.current = null;
+      flowAccumulatedSecsRef.current = 0;
+      setOvertimeSeconds(0);
+      setFlowElapsedSeconds(0);
+      setTimerMode('POMODORO');
+      timerModeRef.current = 'POMODORO';
 
       pomoStartMinsRef.current = mins;
       pomoSecondsLeftRef.current = leftSecs;
@@ -969,7 +1045,39 @@ export const App: React.FC = () => {
   );
 
   const handleTogglePomoRun = useCallback(() => {
+    if (timerModeRef.current === 'FLOWTIME') {
+      if (pomoRunning) {
+        const totalFlow =
+          flowAccumulatedSecsRef.current +
+          (flowStartMsRef.current
+            ? Math.max(0, Math.floor((Date.now() - flowStartMsRef.current) / 1000))
+            : 0);
+        flowAccumulatedSecsRef.current = totalFlow;
+        flowStartMsRef.current = null;
+        setFlowElapsedSeconds(totalFlow);
+        setPomoRunning(false);
+      } else {
+        flowStartMsRef.current = Date.now();
+        soundEngine.playTempleBell(0.85);
+        setPomoRunning(true);
+      }
+      return;
+    }
+
     if (pomoRunning) {
+      // If currently counting Flow overtime, pause overtime snapshot
+      if (overtimeStartMsRef.current !== null) {
+        const ot = getLiveOvertimeSeconds();
+        overtimeBaseSecsRef.current = ot;
+        overtimeStartMsRef.current = null;
+        setOvertimeSeconds(ot);
+        pomoSecondsLeftRef.current = 0;
+        setPomoSecondsLeft(0);
+        pomoEndTimeMsRef.current = null;
+        setPomoRunning(false);
+        return;
+      }
+
       // Pause: snapshot exact remaining seconds from wall-clock target AND persist to DB
       const rem =
         pomoEndTimeMsRef.current !== null
@@ -998,6 +1106,12 @@ export const App: React.FC = () => {
         }));
       }
     } else {
+      if (overtimeBaseSecsRef.current > 0) {
+        overtimeStartMsRef.current = Date.now();
+        soundEngine.playTempleBell(0.65);
+        setPomoRunning(true);
+        return;
+      }
       const secs =
         pomoSecondsLeftRef.current > 0
           ? pomoSecondsLeftRef.current
@@ -1008,10 +1122,70 @@ export const App: React.FC = () => {
       soundEngine.playTempleBell(0.85);
       setPomoRunning(true);
     }
-  }, [pomoRunning, focusedStrikeId, pomoTotalSeconds, persistDb]);
+  }, [pomoRunning, focusedStrikeId, pomoTotalSeconds, persistDb, getLiveOvertimeSeconds]);
+
+  handleTogglePomoRunRef.current = handleTogglePomoRun;
+
+  const handleChangeTimerMode = useCallback(
+    (nextMode: 'POMODORO' | 'FLOWTIME') => {
+      if (nextMode === timerModeRef.current) return;
+      soundEngine.playWoodenFish(0.6);
+      if (pomoRunning) {
+        handleTogglePomoRun();
+      }
+      overtimeStartMsRef.current = null;
+      overtimeBaseSecsRef.current = 0;
+      setOvertimeSeconds(0);
+      flowStartMsRef.current = null;
+      flowAccumulatedSecsRef.current = 0;
+      setFlowElapsedSeconds(0);
+      timerModeRef.current = nextMode;
+      setTimerMode(nextMode);
+    },
+    [pomoRunning, handleTogglePomoRun]
+  );
+
+  const handleExtendPomoMinutes = useCallback(
+    (deltaMins: number) => {
+      const addSecs = Math.max(60, Math.round(deltaMins * 60));
+      soundEngine.playWoodenFish(0.65);
+      if (timerModeRef.current !== 'POMODORO') return;
+
+      const curOt = getLiveOvertimeSeconds();
+      if (curOt > 0 || overtimeStartMsRef.current !== null) {
+        const workedSecs = pomoTotalSeconds + curOt;
+        const nextTotal = workedSecs + addSecs;
+        overtimeStartMsRef.current = null;
+        overtimeBaseSecsRef.current = 0;
+        setOvertimeSeconds(0);
+        pomoCompletedGuardRef.current = false;
+        pomoStartMinsRef.current = Math.round(nextTotal / 60);
+        pomoSecondsLeftRef.current = addSecs;
+        setPomoTotalSeconds(nextTotal);
+        setPomoSecondsLeft(addSecs);
+        if (pomoRunning) {
+          pomoEndTimeMsRef.current = Date.now() + addSecs * 1000;
+        }
+        return;
+      }
+
+      const curRem = getLiveRemainingSeconds();
+      const nextRem = curRem + addSecs;
+      const nextTotal = pomoTotalSeconds + addSecs;
+      pomoCompletedGuardRef.current = false;
+      pomoStartMinsRef.current = Math.round(nextTotal / 60);
+      pomoSecondsLeftRef.current = nextRem;
+      setPomoTotalSeconds(nextTotal);
+      setPomoSecondsLeft(nextRem);
+      if (pomoRunning) {
+        pomoEndTimeMsRef.current = Date.now() + nextRem * 1000;
+      }
+    },
+    [pomoTotalSeconds, pomoRunning, getLiveRemainingSeconds, getLiveOvertimeSeconds]
+  );
 
   const handleExitFocusMode = useCallback(() => {
-    if (focusedStrikeId) {
+    if (focusedStrikeId && timerModeRef.current === 'POMODORO') {
       const rem = getLiveRemainingSeconds();
       const selectedMins = pomoStartMinsRef.current;
       if (rem > 0 && rem < pomoTotalSeconds) {
@@ -1046,6 +1220,12 @@ export const App: React.FC = () => {
       }
     }
     pomoEndTimeMsRef.current = null;
+    overtimeStartMsRef.current = null;
+    overtimeBaseSecsRef.current = 0;
+    flowStartMsRef.current = null;
+    flowAccumulatedSecsRef.current = 0;
+    setOvertimeSeconds(0);
+    setFlowElapsedSeconds(0);
     setPomoRunning(false);
     setFocusedStrikeId(null);
   }, [focusedStrikeId, getLiveRemainingSeconds, pomoTotalSeconds, persistDb]);
@@ -1057,6 +1237,12 @@ export const App: React.FC = () => {
       pomoEndTimeMsRef.current = null;
       pomoCompletedGuardRef.current = false;
       pomoSecondsLeftRef.current = secs;
+      overtimeStartMsRef.current = null;
+      overtimeBaseSecsRef.current = 0;
+      flowStartMsRef.current = null;
+      flowAccumulatedSecsRef.current = 0;
+      setOvertimeSeconds(0);
+      setFlowElapsedSeconds(0);
       setPomoRunning(false);
       setPomoTotalSeconds(secs);
       setPomoSecondsLeft(secs);
@@ -1106,20 +1292,27 @@ export const App: React.FC = () => {
 
   const handleFinishActualPomoSession = useCallback(() => {
     if (!focusedStrikeId) return;
-    const rem = getLiveRemainingSeconds();
-    const elapsedSecs = Math.max(0, pomoTotalSeconds - rem);
+    const elapsedSecs = getLiveElapsedSeconds();
     if (elapsedSecs <= 0) {
       soundEngine.playWoodenFish(0.5);
       showSternMessage(
         'CHƯA CÓ THỜI GIAN TẬP TRUNG THỰC TẾ',
-        'Đồng hồ chưa chạy giây nào trong hiệp này. Hãy bấm "Bắt Đầu Pomodoro" trước rồi hoàn thành hiệp khi đạt mục tiêu!',
+        'Đồng hồ chưa chạy giây nào trong hiệp này. Hãy bấm Bắt Đầu trước rồi chốt hiệp khi muốn lưu kết quả!',
         'info'
       );
       return;
     }
 
+    const activeMode = timerModeRef.current;
     const earnedMins = Math.max(1, Math.round(elapsedSecs / 60));
     const plannedMins = pomoStartMinsRef.current;
+    const logSource =
+      activeMode === 'POMODORO' && elapsedSecs >= pomoTotalSeconds
+        ? 'POMODORO_FULL'
+        : 'POMODORO_EARLY_FINISH';
+    const suggestedBreakMins =
+      activeMode === 'FLOWTIME' ? Math.max(5, Math.min(20, Math.round(earnedMins / 5))) : 5;
+
     soundEngine.playTempleBell(0.95);
     handleResetPomoTimer(plannedMins);
     const endedNow = Date.now();
@@ -1130,7 +1323,7 @@ export const App: React.FC = () => {
             buildFocusSessionLog(
               targetStrike,
               earnedMins,
-              'POMODORO_EARLY_FINISH',
+              logSource,
               todayStr,
               prev.peakGoals,
               endedNow
@@ -1156,15 +1349,15 @@ export const App: React.FC = () => {
         ),
       };
     });
-    startBreakTimer(5);
+    startBreakTimer(suggestedBreakMins);
     showSternMessage(
-      '✓ ĐÃ HOÀN THÀNH HIỆP POMODORO!',
-      `Đã ghi nhận đúng ${earnedMins} phút tập trung thực tế vào Sổ Quỹ Thời Gian & hồ sơ (mục tiêu hiệp đặt ${plannedMins}p).`,
+      '✓ ĐÃ CHỐT HIỆP TẬP TRUNG!',
+      `Đã cộng đúng ${formatDurationHM(earnedMins)} (${earnedMins} phút) thực tế vào Sổ Quỹ Thời Gian & kích hoạt đồng hồ nghỉ phục hồi ${suggestedBreakMins}p.`,
       'seal'
     );
   }, [
     focusedStrikeId,
-    getLiveRemainingSeconds,
+    getLiveElapsedSeconds,
     pomoTotalSeconds,
     handleResetPomoTimer,
     persistDb,
@@ -1173,21 +1366,68 @@ export const App: React.FC = () => {
     showSternMessage,
   ]);
 
-  // Anti-Drift Pomodoro Countdown Loop using endTimeMs + visibilitychange / focus sync
+  // Anti-Drift Pomodoro + Flowtime + Overtime Countdown Loop
   useEffect(() => {
     if (!pomoRunning || !focusedStrikeId) return;
 
-    if (pomoEndTimeMsRef.current === null) {
+    if (timerModeRef.current === 'FLOWTIME') {
+      if (flowStartMsRef.current === null) {
+        flowStartMsRef.current = Date.now();
+      }
+      const syncFlow = () => {
+        if (flowStartMsRef.current === null) return;
+        const total =
+          flowAccumulatedSecsRef.current +
+          Math.max(0, Math.floor((Date.now() - flowStartMsRef.current) / 1000));
+        setFlowElapsedSeconds(total);
+      };
+      syncFlow();
+      const timer = window.setInterval(syncFlow, 250);
+      window.addEventListener('focus', syncFlow);
+      document.addEventListener('visibilitychange', syncFlow);
+      return () => {
+        window.clearInterval(timer);
+        window.removeEventListener('focus', syncFlow);
+        document.removeEventListener('visibilitychange', syncFlow);
+      };
+    }
+
+    if (overtimeStartMsRef.current === null && pomoEndTimeMsRef.current === null) {
       pomoEndTimeMsRef.current = Date.now() + pomoSecondsLeftRef.current * 1000;
     }
 
     const syncRemaining = () => {
+      if (overtimeStartMsRef.current !== null) {
+        const ot =
+          overtimeBaseSecsRef.current +
+          Math.max(0, Math.floor((Date.now() - overtimeStartMsRef.current) / 1000));
+        setOvertimeSeconds(ot);
+        return;
+      }
+
       if (!pomoEndTimeMsRef.current || pomoCompletedGuardRef.current) return;
       const rem = Math.max(0, Math.ceil((pomoEndTimeMsRef.current - Date.now()) / 1000));
       pomoSecondsLeftRef.current = rem;
       setPomoSecondsLeft(rem);
 
       if (rem <= 0) {
+        if (allowFlowOvertimeRef.current) {
+          // Flow-friendly transition: ring gentle bell once and seamlessly keep counting overtime!
+          soundEngine.playTempleBell(1.0);
+          overtimeStartMsRef.current = pomoEndTimeMsRef.current || Date.now();
+          overtimeBaseSecsRef.current = 0;
+          pomoEndTimeMsRef.current = null;
+          pomoSecondsLeftRef.current = 0;
+          setPomoSecondsLeft(0);
+          setOvertimeSeconds(1);
+          showSternMessage(
+            '🌊 ĐÃ ĐẠT MỐC POMODORO — TIẾP TỤC ĐẾM VƯỢT GIỜ FLOW!',
+            'Không cắt ngang cảm hứng! Đồng hồ đang tự đếm thêm thời gian vượt giờ. Bấm "Chốt hiệp" bất cứ lúc nào để lưu toàn bộ phút thực tế.',
+            'seal'
+          );
+          return;
+        }
+
         pomoCompletedGuardRef.current = true;
         pomoEndTimeMsRef.current = null;
         soundEngine.playTempleBell(1.0);
@@ -1273,7 +1513,7 @@ export const App: React.FC = () => {
       document.removeEventListener('visibilitychange', syncRemaining);
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
-  }, [pomoRunning, focusedStrikeId, pomoTotalSeconds, persistDb, todayStr, startBreakTimer, showSternMessage]);
+  }, [pomoRunning, timerMode, focusedStrikeId, pomoTotalSeconds, persistDb, todayStr, startBreakTimer, showSternMessage]);
 
   // Auto-Break Countdown Loop (timestamp-anchored)
   useEffect(() => {
@@ -1298,12 +1538,31 @@ export const App: React.FC = () => {
     return () => window.clearInterval(id);
   }, [breakSecondsLeft !== null, showSternMessage]);
 
-  // Dynamic Window / Browser Tab Title with Live Countdown
+  // Dynamic Window / Browser Tab Title + Throttled Tray Sync with Live Countdown / Flowtime
   useEffect(() => {
-    if (focusedStrike && pomoRunning) {
+    let displayClock = '';
+    if (focusedStrike && timerMode === 'FLOWTIME') {
+      const mm = String(Math.floor(flowElapsedSeconds / 60)).padStart(2, '0');
+      const ss = String(flowElapsedSeconds % 60).padStart(2, '0');
+      displayClock = `${mm}:${ss}`;
+      document.title = pomoRunning
+        ? `[🌊 ${displayClock}] ${focusedStrike.title} — Lên Núi`
+        : `[⏸ ${displayClock}] Flowtime — Lên Núi`;
+    } else if (focusedStrike && overtimeSeconds > 0) {
+      const mm = String(Math.floor(overtimeSeconds / 60)).padStart(2, '0');
+      const ss = String(overtimeSeconds % 60).padStart(2, '0');
+      displayClock = `+${mm}:${ss}`;
+      document.title = `[🌊 ${displayClock}] Flow vượt giờ — ${focusedStrike.title}`;
+    } else if (focusedStrike && pomoRunning) {
       const mm = String(Math.floor(pomoSecondsLeft / 60)).padStart(2, '0');
       const ss = String(pomoSecondsLeft % 60).padStart(2, '0');
-      document.title = `[${mm}:${ss}] 🔥 ${focusedStrike.title} — Lên Núi`;
+      displayClock = `${mm}:${ss}`;
+      document.title = `[${displayClock}] 🔥 ${focusedStrike.title} — Lên Núi`;
+    } else if (focusedStrike) {
+      const mm = String(Math.floor(pomoSecondsLeft / 60)).padStart(2, '0');
+      const ss = String(pomoSecondsLeft % 60).padStart(2, '0');
+      displayClock = `${mm}:${ss}`;
+      document.title = `LÊN NÚI (ASCEND THE MOUNTAIN) — Hệ Thống Kỷ Luật Tu Luyện`;
     } else if (breakSecondsLeft !== null) {
       const mm = String(Math.floor(breakSecondsLeft / 60)).padStart(2, '0');
       const ss = String(breakSecondsLeft % 60).padStart(2, '0');
@@ -1311,7 +1570,38 @@ export const App: React.FC = () => {
     } else {
       document.title = 'LÊN NÚI (ASCEND THE MOUNTAIN) — Hệ Thống Kỷ Luật Tu Luyện';
     }
-  }, [focusedStrike, pomoRunning, pomoSecondsLeft, breakSecondsLeft]);
+
+    const now = Date.now();
+    if (!focusedStrike) {
+      if (lastTrayPomoSyncAtRef.current !== -1) {
+        lastTrayPomoSyncAtRef.current = -1;
+        void desktopBridge.syncPomodoroStateToDaemon({
+          active: false,
+          running: false,
+          mode: timerMode,
+          displayClock: '',
+          strikeTitle: '',
+        });
+      }
+    } else if (now - lastTrayPomoSyncAtRef.current >= 5000 || !pomoRunning) {
+      lastTrayPomoSyncAtRef.current = now;
+      void desktopBridge.syncPomodoroStateToDaemon({
+        active: true,
+        running: pomoRunning,
+        mode: timerMode,
+        displayClock,
+        strikeTitle: focusedStrike.title,
+      });
+    }
+  }, [
+    focusedStrike,
+    timerMode,
+    pomoRunning,
+    pomoSecondsLeft,
+    overtimeSeconds,
+    flowElapsedSeconds,
+    breakSecondsLeft,
+  ]);
 
   // Global Keyboard Shortcuts (Ctrl+K, Ctrl+1..9, Space/Esc in Focus Mode)
   useEffect(() => {
@@ -1733,8 +2023,7 @@ export const App: React.FC = () => {
   const getUnsavedActualMinsForStrike = useCallback(
     (strike: DailyStrikeTodoEntity): number => {
       if (focusedStrikeId === strike.id) {
-        const rem = getLiveRemainingSeconds();
-        const elapsedSecs = Math.max(0, pomoTotalSeconds - rem);
+        const elapsedSecs = getLiveElapsedSeconds();
         return elapsedSecs > 0 ? Math.max(1, Math.round(elapsedSecs / 60)) : 0;
       }
       if (strike.savedPomoSecondsLeft != null && strike.savedPomoTotalSeconds != null) {
@@ -1746,7 +2035,7 @@ export const App: React.FC = () => {
       }
       return 0;
     },
-    [focusedStrikeId, getLiveRemainingSeconds, pomoTotalSeconds]
+    [focusedStrikeId, getLiveElapsedSeconds]
   );
 
   const handleCompleteStrikeAction = (strike: DailyStrikeTodoEntity) => {
@@ -2257,11 +2546,10 @@ export const App: React.FC = () => {
           [record.date]: record,
         },
       }));
-      const h = Math.floor(record.workDurationMins / 60);
-      const m = record.workDurationMins % 60;
+      setDaemonStatus((prev) => (prev ? { ...prev, suggestedReturnHome: null } : prev));
       const durText = record.isDayOffNoWork
         ? '0h (Hôm nay nghỉ làm)'
-        : `${h > 0 ? `${h}h ` : ''}${m}p (${record.workStartTime}${
+        : `${formatDurationHM(record.workDurationMins)} (${record.workStartTime}${
             record.workEndTime ? ` → ${record.workEndTime}` : ''
           })`;
       showSternMessage(
@@ -2272,6 +2560,11 @@ export const App: React.FC = () => {
     },
     [persistDb, showSternMessage]
   );
+
+  const handleDismissReturnHomeSuggestion = useCallback((shiftDateStr: string) => {
+    setDaemonStatus((prev) => (prev ? { ...prev, suggestedReturnHome: null } : prev));
+    void desktopBridge.dismissReturnHomeSuggestion(shiftDateStr);
+  }, []);
 
   const handleClearWorkShift = useCallback(
     (dateStr: string) => {
@@ -2369,7 +2662,10 @@ export const App: React.FC = () => {
 
   const liveActiveSession = useMemo<LiveActiveSessionInput | null>(() => {
     if (!focusedStrike) return null;
-    const elapsedSecs = Math.max(0, pomoTotalSeconds - pomoSecondsLeft);
+    const elapsedSecs =
+      timerMode === 'FLOWTIME'
+        ? flowElapsedSeconds
+        : Math.max(0, pomoTotalSeconds - pomoSecondsLeft) + overtimeSeconds;
     const elapsedMins = elapsedSecs >= 30 ? Math.max(1, Math.round(elapsedSecs / 60)) : 0;
     if (elapsedMins <= 0) return null;
     return {
@@ -2380,7 +2676,16 @@ export const App: React.FC = () => {
       elapsedMins,
       date: todayStr,
     };
-  }, [focusedStrike, focusedActivityType, pomoTotalSeconds, pomoSecondsLeft, todayStr]);
+  }, [
+    focusedStrike,
+    focusedActivityType,
+    timerMode,
+    flowElapsedSeconds,
+    pomoTotalSeconds,
+    pomoSecondsLeft,
+    overtimeSeconds,
+    todayStr,
+  ]);
 
   const todayTimeAudit = useMemo(
     () => computeDayTimeAudit(db, todayStr, todayStr, nowTick, liveActiveSession),
@@ -2968,9 +3273,13 @@ export const App: React.FC = () => {
               focusedStrike={focusedStrike}
               focusIsSideQuest={focusIsSideQuest}
               focusContextTitle={focusContextTitle}
+              timerMode={timerMode}
+              allowFlowOvertime={allowFlowOvertime}
               pomoSecondsLeft={pomoSecondsLeft}
               pomoTotalSeconds={pomoTotalSeconds}
               pomoRunning={pomoRunning}
+              overtimeSeconds={overtimeSeconds}
+              flowElapsedSeconds={flowElapsedSeconds}
               pomoSelectedMins={pomoStartMinsRef.current}
               activityType={focusedActivityType}
               ambientMode={ambientMode}
@@ -2979,11 +3288,17 @@ export const App: React.FC = () => {
               breakTotalSeconds={breakTotalSeconds}
               pinnedOptimizationNotes={pinnedOptimizationNotes}
               onExitFocus={handleExitFocusMode}
+              onChangeTimerMode={handleChangeTimerMode}
+              onToggleAllowFlowOvertime={() => setAllowFlowOvertime((v) => !v)}
+              onExtendPomoMinutes={handleExtendPomoMinutes}
               onSelectDuration={(mins) => {
                 const secs = mins * 60;
                 pomoStartMinsRef.current = mins;
                 pomoEndTimeMsRef.current = null;
                 pomoCompletedGuardRef.current = false;
+                overtimeStartMsRef.current = null;
+                overtimeBaseSecsRef.current = 0;
+                setOvertimeSeconds(0);
                 pomoSecondsLeftRef.current = secs;
                 setPomoRunning(false);
                 setPomoTotalSeconds(secs);
@@ -3111,6 +3426,8 @@ export const App: React.FC = () => {
                 dayShiftStartTime={dayShiftStartTime}
                 nightShiftStartTime={nightShiftStartTime}
                 liveActiveSession={liveActiveSession}
+                suggestedReturnHome={daemonStatus?.suggestedReturnHome}
+                onDismissReturnHomeSuggestion={handleDismissReturnHomeSuggestion}
                 onAddManualTimeLog={handleAddManualTimeLog}
                 onDeleteTimeLog={handleDeleteTimeLog}
                 onUpdateTimeAuditConfig={handleUpdateTimeAuditConfig}

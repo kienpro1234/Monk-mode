@@ -1,12 +1,7 @@
 import { MonkDatabaseSchema, OptimizationNoteEntity } from '../types/models';
+import { getTodayDateStr } from './mountainLaws';
 
-export function getTodayDateStr(nowMs: number = Date.now()): string {
-  const d = new Date(nowMs);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
+export { getTodayDateStr };
 
 export function createDefaultOptimizationNotes(nowMs: number = Date.now()): OptimizationNoteEntity[] {
   return [

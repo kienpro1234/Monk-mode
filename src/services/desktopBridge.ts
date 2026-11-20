@@ -13,6 +13,15 @@ export interface ScreenSourceItem {
   dataUrl: string;
 }
 
+export interface SuggestedReturnHomeInfo {
+  shiftDateStr: string;
+  shiftMode: 'DAY' | 'NIGHT';
+  workStartTime: string;
+  detectedHHMM: string;
+  detectedAtMs: number;
+  estimatedWorkMins: number;
+}
+
 export interface DaemonStatusInfo {
   ok: boolean;
   pid?: number;
@@ -26,6 +35,11 @@ export interface DaemonStatusInfo {
   pendingMinutesLeft?: number;
   pendingViolationsCount?: number;
   dbUpdatedAt?: number;
+  workShiftConfirmed?: boolean;
+  suggestedReturnHome?: SuggestedReturnHomeInfo | null;
+  pendingTrayAction?: { id: number; type: 'TOGGLE_POMO' } | null;
+  recentBlockedProcesses?: Array<{ processName: string; title: string; timestamp: number }>;
+  processGuardActive?: boolean;
 }
 
 export interface AutoStartStatusInfo {
@@ -344,7 +358,6 @@ export const desktopBridge = {
       return;
     }
 
-    safeSetLocalStorage(LOCAL_STORAGE_KEY, JSON.stringify(stampedDb));
     pendingSavePayload = stampedDb;
     pendingSaveAllowEmpty = pendingSaveAllowEmpty || allowEmptyOverwrite;
     if (pendingSaveTimer !== null) {
@@ -505,7 +518,14 @@ export const desktopBridge = {
     return { ok: false };
   },
 
-  async pingHeartbeat(): Promise<{ ok: boolean; evaluated?: boolean; lastActiveAt?: number }> {
+  async pingHeartbeat(): Promise<{
+    ok: boolean;
+    evaluated?: boolean;
+    lastActiveAt?: number;
+    dbUpdatedAt?: number;
+    suggestedReturnHome?: SuggestedReturnHomeInfo | null;
+    pendingTrayAction?: { id: number; type: 'TOGGLE_POMO' } | null;
+  }> {
     try {
       const res = await fetch(apiUrl('/api/daemon/heartbeat'), { method: 'POST' });
       if (res.ok) return await res.json();
@@ -513,6 +533,54 @@ export const desktopBridge = {
       // Ignore
     }
     return { ok: false };
+  },
+
+  async confirmWorkReturnFromDaemon(): Promise<{
+    ok: boolean;
+    alreadyConfirmed?: boolean;
+    openApp?: boolean;
+    reason?: string;
+    record?: any;
+  }> {
+    try {
+      const res = await fetch(apiUrl('/api/daemon/confirm-work-return'), { method: 'POST' });
+      if (res.ok) return await res.json();
+    } catch {
+      // Ignore
+    }
+    return { ok: false };
+  },
+
+  async dismissReturnHomeSuggestion(shiftDateStr: string): Promise<{ ok: boolean }> {
+    try {
+      const res = await fetch(apiUrl('/api/daemon/dismiss-return-suggestion'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shiftDateStr }),
+      });
+      if (res.ok) return await res.json();
+    } catch {
+      // Ignore
+    }
+    return { ok: false };
+  },
+
+  async syncPomodoroStateToDaemon(state: {
+    active: boolean;
+    running: boolean;
+    mode: 'POMODORO' | 'FLOWTIME';
+    displayClock: string;
+    strikeTitle: string;
+  }): Promise<void> {
+    try {
+      await fetch(apiUrl('/api/daemon/pomodoro-state'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state),
+      });
+    } catch {
+      // Ignore when offline
+    }
   },
 
   async getAutoStartStatus(): Promise<AutoStartStatusInfo> {

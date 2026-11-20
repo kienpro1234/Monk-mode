@@ -6,9 +6,11 @@ import { execFile, spawn } from 'child_process';
 import {
   evaluatePendingDays,
   getCurrentPendingObligations,
+  getEffectiveDayStartTime,
   getEffectiveNightStartTime,
   getLawConfig,
   getShiftDateStr,
+  isRestDay,
 } from './lawEngine.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -63,6 +65,137 @@ let watchdogTimer = null;
 let lastReminderSent = { shiftDateStr: '', thirtyMin: false, tenMin: false };
 let lastScheduleNotified = { shiftDateStr: '', notifiedKeys: new Set() };
 let mockAutoStartEnabled = true;
+
+let processGuardTimer = null;
+let isProcessGuardBusy = false;
+let recentBlockedProcesses = [];
+
+let lastWatchdogWallClockMs = Date.now();
+let lastSuggestedReturnDate = '';
+let dismissedReturnDate = '';
+let suggestedReturnHome = null;
+let lastKnownIdleSec = 0;
+let lastIdleCheckAtMs = 0;
+let livePomodoroTrayState = null;
+let pendingTrayAction = null;
+
+export const DEFAULT_DISTRACTING_PROCESSES = [
+  'steam',
+  'epicgameslauncher',
+  'riotclientservices',
+  'leagueclient',
+  'valorant',
+  'discord',
+  'spotify',
+  'vlc',
+  'netflix',
+  'tiktok',
+];
+
+export const SAFE_SYSTEM_PROCESSES = new Set([
+  'electron',
+  'explorer',
+  'powershell',
+  'pwsh',
+  'cmd',
+  'taskmgr',
+  'applicationframehost',
+  'systemsettings',
+  'textinputhost',
+  'code',
+  'chrome',
+  'msedge',
+  'node',
+]);
+
+export function formatDurationHMServer(mins) {
+  const m = Math.max(0, Math.round(mins || 0));
+  if (m < 60) return `${m}p`;
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  return r === 0 ? `${h}h` : `${h}h${String(r).padStart(2, '0')}p`;
+}
+
+export function findProcessesToBlock(
+  runningApps = [],
+  whitelist = [],
+  distractingList = DEFAULT_DISTRACTING_PROCESSES
+) {
+  const allowedSet = new Set(
+    (Array.isArray(whitelist) ? whitelist : [])
+      .map((s) => String(s || '').trim().toLowerCase().replace(/\.exe$/i, ''))
+      .filter(Boolean)
+  );
+  const distractingSet = new Set(
+    (Array.isArray(distractingList) ? distractingList : DEFAULT_DISTRACTING_PROCESSES).map((s) =>
+      String(s || '').trim().toLowerCase().replace(/\.exe$/i, '')
+    )
+  );
+  const matched = [];
+  for (const proc of Array.isArray(runningApps) ? runningApps : []) {
+    const pName = String(proc?.ProcessName || '').trim().toLowerCase().replace(/\.exe$/i, '');
+    if (!pName || SAFE_SYSTEM_PROCESSES.has(pName) || allowedSet.has(pName)) continue;
+    if (distractingSet.has(pName)) {
+      matched.push(proc);
+    }
+  }
+  return matched;
+}
+
+export function computeWorkShiftElapsedNow(db, nowMs = Date.now()) {
+  const config = getLawConfig(db);
+  const shiftMode = config.workShiftMode || 'DAY';
+  const nightStartTime = getEffectiveNightStartTime(config);
+  const dayStartTime = getEffectiveDayStartTime(config);
+  const shiftDateStr = getShiftDateStr(nowMs, shiftMode, nightStartTime);
+  const workStartTime = shiftMode === 'NIGHT' ? nightStartTime : dayStartTime;
+  const [sy, sm, sd] = shiftDateStr.split('-').map(Number);
+  const [wh, wm] = workStartTime.split(':').map(Number);
+  const startMs = new Date(sy, (sm || 1) - 1, sd || 1, wh || 0, wm || 0, 0, 0).getTime();
+  const diffMins = Math.round((nowMs - startMs) / 60000);
+  const d = new Date(nowMs);
+  const nowHHMM = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return {
+    shiftDateStr,
+    shiftMode,
+    workStartTime,
+    nowHHMM,
+    startMs,
+    diffMins,
+    isPlausibleArrival: diffMins >= 15 && diffMins <= 16 * 60,
+    isSmartAutoDetectWindow: diffMins >= 4 * 60 && diffMins <= 15 * 60,
+  };
+}
+
+export function shouldSuggestReturnHome(params) {
+  const {
+    db,
+    nowMs = Date.now(),
+    gapSinceLastTickMs = 0,
+    lastSuggestedShiftDate = '',
+    dismissedShiftDate = '',
+    triggerReason = 'watchdog',
+    idleJustResumed = false,
+  } = params || {};
+
+  if (!db || !db.session) return { shouldSuggest: false, info: null };
+  const info = computeWorkShiftElapsedNow(db, nowMs);
+  if (db.dailyWorkShiftLogs?.[info.shiftDateStr]) {
+    return { shouldSuggest: false, info };
+  }
+  if (isRestDay(db, info.shiftDateStr, getLawConfig(db))) {
+    return { shouldSuggest: false, info };
+  }
+  if (lastSuggestedShiftDate === info.shiftDateStr || dismissedShiftDate === info.shiftDateStr) {
+    return { shouldSuggest: false, info };
+  }
+  if (!info.isSmartAutoDetectWindow) {
+    return { shouldSuggest: false, info };
+  }
+  const triggeredByActivity =
+    triggerReason === 'startup' || gapSinceLastTickMs >= 3 * 60 * 1000 || idleJustResumed;
+  return { shouldSuggest: triggeredByActivity, info };
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -562,12 +695,45 @@ function updateTrayStatus(db, pendingInfo) {
     const streak = db?.session?.currentStreak ?? 0;
     const pendingCount = pendingInfo?.findings?.length ?? 0;
     const cutoffStr = pendingInfo?.cutoffMs ? formatHHMM(pendingInfo.cutoffMs) : '23:59';
-    const menuLabel = db?.session
-      ? `Streak: ${streak} ngày | Việc còn lại: ${pendingCount} (Chốt ${cutoffStr})`
-      : 'Lên Núi — Chưa có phiên hoạt động';
-    const tooltip = db?.session
-      ? `Lên Núi • Streak ${streak}d • Còn ${pendingCount} mục`
-      : 'Lên Núi — Đang chạy nền';
+    const now = Date.now();
+
+    let workShiftConfirmed = false;
+    let workShiftMenuLabel = '🏠 Chốt Giờ Đi Làm Hôm Nay (Mở App)';
+    if (db?.session) {
+      const workInfo = computeWorkShiftElapsedNow(db, now);
+      const existingShift = db.dailyWorkShiftLogs?.[workInfo.shiftDateStr];
+      if (existingShift) {
+        workShiftConfirmed = true;
+        workShiftMenuLabel = existingShift.isDayOffNoWork
+          ? '🌴 Hôm nay: Nghỉ làm (0h)'
+          : `✅ Đã chốt giờ làm: ${formatDurationHMServer(existingShift.workDurationMins)}`;
+      } else if (workInfo.isPlausibleArrival) {
+        workShiftMenuLabel = `🏠 Xác Nhận Đã Đi Làm Về (${workInfo.workStartTime}→${workInfo.nowHHMM} = ${formatDurationHMServer(
+          workInfo.diffMins
+        )})`;
+      }
+    }
+
+    const pomoActive = Boolean(livePomodoroTrayState?.active);
+    const pomoRunning = Boolean(livePomodoroTrayState?.running);
+    const pomoModeLabel = livePomodoroTrayState?.mode === 'FLOWTIME' ? 'Flowtime' : 'Pomodoro';
+    const pomoClock = livePomodoroTrayState?.displayClock || '00:00';
+    const pomoMenuLabel = pomoActive
+      ? `${pomoRunning ? '⏸ Tạm Dừng' : '▶ Tiếp Tục'} ${pomoModeLabel} (${pomoClock})`
+      : '⏱️ Mở App Bắt Đầu Pomodoro';
+
+    const menuLabel =
+      pomoActive && pomoRunning
+        ? `🔥 ${pomoModeLabel} ${pomoClock} | Streak ${streak}d`
+        : db?.session
+        ? `Streak: ${streak} ngày | Việc còn lại: ${pendingCount} (Chốt ${cutoffStr})`
+        : 'Lên Núi — Chưa có phiên hoạt động';
+    const tooltip =
+      pomoActive && pomoRunning
+        ? `Lên Núi • ${pomoModeLabel} ${pomoClock}`
+        : db?.session
+        ? `Lên Núi • Streak ${streak}d • Còn ${pendingCount} mục`
+        : 'Lên Núi — Đang chạy nền';
     const summaryTitle =
       pendingCount > 0
         ? `Còn ${pendingCount} hạng mục trước ${cutoffStr}`
@@ -578,7 +744,7 @@ function updateTrayStatus(db, pendingInfo) {
         : `Còn ${pendingInfo?.minutesLeft ?? 0} phút đến giờ chốt sổ (${cutoffStr}). Giữ vững kỷ luật!`;
 
     writeJsonAtomic(TRAY_STATUS_PATH, {
-      updatedAt: Date.now(),
+      updatedAt: now,
       streak,
       pendingCount,
       cutoffStr,
@@ -586,9 +752,133 @@ function updateTrayStatus(db, pendingInfo) {
       tooltip,
       summaryTitle,
       summaryBody,
+      workShiftConfirmed,
+      workShiftMenuLabel,
+      pomoMenuLabel,
     });
   } catch {
     // Ignore
+  }
+}
+
+async function getWindowsIdleSeconds() {
+  const ps = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class IdleCheck {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+  public static uint GetIdleSec() {
+    LASTINPUTINFO lii = new LASTINPUTINFO();
+    lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+    if (!GetLastInputInfo(ref lii)) return 0;
+    return (uint)((Environment.TickCount - (int)lii.dwTime) / 1000);
+  }
+}
+"@
+Write-Output ([IdleCheck]::GetIdleSec())
+`;
+  const res = await runPowerShell(ps);
+  if (!res.ok) return null;
+  const parsed = Number(res.stdout);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function enforceProcessGuardTick() {
+  if (
+    !isMonkModeLocked ||
+    !processGuardEnabled ||
+    isProcessGuardBusy ||
+    SKIP_OS_SIDE_EFFECTS ||
+    process.platform !== 'win32'
+  ) {
+    return;
+  }
+  isProcessGuardBusy = true;
+  try {
+    const ps = `Get-Process | Where-Object { $_.MainWindowTitle -ne "" } | Select-Object Id, ProcessName, MainWindowTitle | ConvertTo-Json -Compress`;
+    const out = await runPowerShell(ps);
+    if (!out.ok || !out.stdout) return;
+    let apps = [];
+    try {
+      const parsed = JSON.parse(out.stdout);
+      apps = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      apps = [];
+    }
+    const toBlock = findProcessesToBlock(apps, activeWhitelist);
+    for (const proc of toBlock) {
+      const pid = Number(proc.Id);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      await runPowerShell(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`);
+      const entry = {
+        processName: String(proc.ProcessName || ''),
+        title: String(proc.MainWindowTitle || ''),
+        timestamp: Date.now(),
+      };
+      recentBlockedProcesses = [entry, ...recentBlockedProcesses].slice(0, 20);
+      logDaemon(`Process Guard closed distracting app: ${entry.processName} (${entry.title})`);
+      pushTrayNotification(
+        `🛡️ Process Guard đã chặn: ${entry.processName}`,
+        `Đã tự đóng "${entry.title || entry.processName}" vì đang bật Kỷ Luật Monk Mode.`,
+        'warning'
+      );
+    }
+  } finally {
+    isProcessGuardBusy = false;
+  }
+}
+
+async function checkSmartIdleReturnHomeTick() {
+  if (SKIP_OS_SIDE_EFFECTS || process.platform !== 'win32') return;
+  const rawDb = readJsonSafe(DB_PATH);
+  if (!rawDb || !rawDb.session) return;
+  const info = computeWorkShiftElapsedNow(rawDb, Date.now());
+  if (
+    rawDb.dailyWorkShiftLogs?.[info.shiftDateStr] ||
+    !info.isSmartAutoDetectWindow ||
+    lastSuggestedReturnDate === info.shiftDateStr ||
+    dismissedReturnDate === info.shiftDateStr
+  ) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastIdleCheckAtMs < 60000) return;
+  lastIdleCheckAtMs = now;
+  const idleSec = await getWindowsIdleSeconds();
+  if (idleSec === null) return;
+  const idleJustResumed = lastKnownIdleSec >= 1200 && idleSec < 60;
+  lastKnownIdleSec = idleSec;
+  if (idleJustResumed) {
+    const decision = shouldSuggestReturnHome({
+      db: rawDb,
+      nowMs: now,
+      gapSinceLastTickMs: 0,
+      lastSuggestedShiftDate: lastSuggestedReturnDate,
+      dismissedShiftDate: dismissedReturnDate,
+      triggerReason: 'idle-resume',
+      idleJustResumed: true,
+    });
+    if (decision.shouldSuggest && decision.info) {
+      lastSuggestedReturnDate = decision.info.shiftDateStr;
+      suggestedReturnHome = {
+        shiftDateStr: decision.info.shiftDateStr,
+        shiftMode: decision.info.shiftMode,
+        workStartTime: decision.info.workStartTime,
+        detectedHHMM: decision.info.nowHHMM,
+        detectedAtMs: now,
+        estimatedWorkMins: decision.info.diffMins,
+      };
+      pushTrayNotification(
+        `🏠 Chào mừng bạn đi làm về lúc ${decision.info.nowHHMM}!`,
+        `Chuột phải biểu tượng Lên Núi ở khay hệ thống chọn "Xác Nhận Đã Đi Làm Về" để chốt ${formatDurationHMServer(
+          decision.info.diffMins
+        )} & tính Quỹ Rảnh hôm nay.`,
+        'info'
+      );
+    }
   }
 }
 
@@ -701,6 +991,40 @@ function runBackgroundEvaluation(triggerReason = 'watchdog') {
 
   // Cập nhật heartbeat mới nhất SAU khi đánh giá bù xong
   recordHeartbeat(now, activeDb.session.maxObservedAt || now);
+
+  // Kiểm tra phát hiện "Vừa đi làm về" (sau khi bật máy hoặc máy ngủ dậy giữa ca -> mở khóa)
+  const gapSinceLastTickMs = lastWatchdogWallClockMs > 0 ? Math.max(0, now - lastWatchdogWallClockMs) : 0;
+  lastWatchdogWallClockMs = now;
+  if (activeDb.dailyWorkShiftLogs?.[todayShiftStr]) {
+    suggestedReturnHome = null;
+  } else {
+    const returnDecision = shouldSuggestReturnHome({
+      db: activeDb,
+      nowMs: now,
+      gapSinceLastTickMs,
+      lastSuggestedShiftDate: lastSuggestedReturnDate,
+      dismissedShiftDate: dismissedReturnDate,
+      triggerReason,
+    });
+    if (returnDecision.shouldSuggest && returnDecision.info) {
+      lastSuggestedReturnDate = returnDecision.info.shiftDateStr;
+      suggestedReturnHome = {
+        shiftDateStr: returnDecision.info.shiftDateStr,
+        shiftMode: returnDecision.info.shiftMode,
+        workStartTime: returnDecision.info.workStartTime,
+        detectedHHMM: returnDecision.info.nowHHMM,
+        detectedAtMs: now,
+        estimatedWorkMins: returnDecision.info.diffMins,
+      };
+      pushTrayNotification(
+        `🏠 Chào mừng bạn đi làm về lúc ${returnDecision.info.nowHHMM}!`,
+        `Chuột phải biểu tượng Lên Núi ở khay hệ thống chọn "Xác Nhận Đã Đi Làm Về" để chốt ${formatDurationHMServer(
+          returnDecision.info.diffMins
+        )} (${returnDecision.info.workStartTime}→${returnDecision.info.nowHHMM}).`,
+        'info'
+      );
+    }
+  }
 
   // Kiểm tra nghĩa vụ hôm nay & gửi nhắc nhở trước giờ chốt sổ (30p & 10p)
   const pendingInfo = getCurrentPendingObligations(activeDb, now);
@@ -1113,15 +1437,29 @@ function stopTrayHelper() {
   }
 }
 
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes = 35 * 1024 * 1024) {
   return new Promise((resolve) => {
-    let body = '';
+    const chunks = [];
+    let totalBytes = 0;
+    let tooLarge = false;
     req.on('data', (chunk) => {
-      body += chunk;
+      if (tooLarge) return;
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        tooLarge = true;
+        resolve({ __payloadTooLarge: true });
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('error', () => {
+      if (!tooLarge) resolve({});
     });
     req.on('end', () => {
+      if (tooLarge) return;
       try {
-        resolve(body ? JSON.parse(body) : {});
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        resolve(raw ? JSON.parse(raw) : {});
       } catch {
         resolve({});
       }
@@ -1222,6 +1560,11 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/db' && req.method === 'POST') {
       ensureDataDir();
       const body = await readJsonBody(req);
+      if (body?.__payloadTooLarge) {
+        res.statusCode = 413;
+        res.end(JSON.stringify({ ok: false, error: 'Dữ liệu quá giới hạn cho phép (35MB).' }));
+        return;
+      }
       if (body?.data && body.data.session) {
         const now = Date.now();
         const extracted = extractEmbeddedProofsFromDb(body.data);
@@ -1317,6 +1660,7 @@ const server = http.createServer(async (req, res) => {
       const db = readJsonSafe(DB_PATH);
       const now = Date.now();
       const pendingInfo = db?.session ? getCurrentPendingObligations(db, now) : null;
+      const workInfo = db?.session ? computeWorkShiftElapsedNow(db, now) : null;
       res.end(
         JSON.stringify({
           ok: true,
@@ -1328,9 +1672,15 @@ const server = http.createServer(async (req, res) => {
           lastHeartbeatAt: lastHeartbeatAt || startedAt,
           lastEvaluationAt: lastEvaluationAt || startedAt,
           dbUpdatedAt,
+          workShiftConfirmed: Boolean(
+            workInfo && db?.dailyWorkShiftLogs?.[workInfo.shiftDateStr]
+          ),
           pendingCutoffMs: pendingInfo?.cutoffMs,
           pendingMinutesLeft: pendingInfo?.minutesLeft,
           pendingViolationsCount: pendingInfo?.findings?.length ?? 0,
+          suggestedReturnHome,
+          recentBlockedProcesses,
+          processGuardActive: Boolean(isMonkModeLocked && processGuardEnabled),
         })
       );
       return;
@@ -1338,14 +1688,129 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/daemon/heartbeat' && req.method === 'POST') {
       const result = runBackgroundEvaluation('ui-heartbeat');
+      const actionToDeliver = pendingTrayAction;
+      pendingTrayAction = null;
       res.end(
         JSON.stringify({
           ok: true,
           evaluated: result.evaluated,
           lastActiveAt: lastHeartbeatAt,
           dbUpdatedAt,
+          suggestedReturnHome,
+          pendingTrayAction: actionToDeliver,
         })
       );
+      return;
+    }
+
+    if (pathname === '/api/daemon/confirm-work-return' && req.method === 'POST') {
+      const db = readJsonSafe(DB_PATH);
+      if (!db || !db.session) {
+        res.end(JSON.stringify({ ok: false, reason: 'Chưa có dữ liệu phiên tu luyện.' }));
+        return;
+      }
+      const now = Date.now();
+      const info = computeWorkShiftElapsedNow(db, now);
+      if (db.dailyWorkShiftLogs?.[info.shiftDateStr]) {
+        suggestedReturnHome = null;
+        const rec = db.dailyWorkShiftLogs[info.shiftDateStr];
+        pushTrayNotification(
+          '✅ Hôm nay đã chốt giờ làm rồi',
+          rec.isDayOffNoWork
+            ? `Ngày ${info.shiftDateStr}: Đã đánh dấu nghỉ làm (0h).`
+            : `Ngày ${info.shiftDateStr}: Đã ghi nhận ${formatDurationHMServer(rec.workDurationMins)}.`,
+          'info'
+        );
+        res.end(JSON.stringify({ ok: true, alreadyConfirmed: true, record: rec }));
+        return;
+      }
+      if (!info.isPlausibleArrival) {
+        pushTrayNotification(
+          '⏰ Ngoài khung tự động chốt giờ về',
+          `Vui lòng tự nhập giờ bắt đầu/kết thúc (hiện cách mốc vào ca ${info.workStartTime} là ${formatDurationHMServer(
+            Math.max(0, info.diffMins)
+          )}).`,
+          'warning'
+        );
+        await focusOrLaunchDesktopWindow(`http://127.0.0.1:${actualPort}`);
+        res.end(JSON.stringify({ ok: false, openApp: true, reason: 'Outside plausible arrival range' }));
+        return;
+      }
+      const record = {
+        date: info.shiftDateStr,
+        shiftMode: info.shiftMode,
+        workStartTime: info.workStartTime,
+        workEndTime: info.nowHHMM,
+        workStartMs: info.startMs,
+        workEndMs: now,
+        workDurationMins: info.diffMins,
+        prepLockMins: 60,
+        confirmedAt: now,
+      };
+      const updatedDb = {
+        ...db,
+        dailyWorkShiftLogs: {
+          ...(db.dailyWorkShiftLogs || {}),
+          [info.shiftDateStr]: record,
+        },
+        session: {
+          ...db.session,
+          lastActiveAt: now,
+          maxObservedAt: Math.max(now, db.session.maxObservedAt || 0),
+        },
+      };
+      writeJsonAtomic(DB_PATH, updatedDb);
+      dbUpdatedAt = now;
+      lastSuggestedReturnDate = info.shiftDateStr;
+      suggestedReturnHome = null;
+      const pendingInfo = getCurrentPendingObligations(updatedDb, now);
+      updateTrayStatus(updatedDb, pendingInfo);
+      pushTrayNotification(
+        `🏠 Đã chốt giờ đi làm: ${formatDurationHMServer(record.workDurationMins)}`,
+        `Ngày ${record.date} (${record.workStartTime} → ${record.workEndTime}). Quỹ Thời Gian 24h đã tự cập nhật realtime!`,
+        'info'
+      );
+      res.end(JSON.stringify({ ok: true, record, dbUpdatedAt }));
+      return;
+    }
+
+    if (pathname === '/api/daemon/dismiss-return-suggestion' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (body?.shiftDateStr) {
+        dismissedReturnDate = String(body.shiftDateStr);
+      }
+      suggestedReturnHome = null;
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (pathname === '/api/daemon/pomodoro-state' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      livePomodoroTrayState = body?.active
+        ? {
+            active: true,
+            running: Boolean(body.running),
+            mode: body.mode === 'FLOWTIME' ? 'FLOWTIME' : 'POMODORO',
+            displayClock: String(body.displayClock || '00:00'),
+            strikeTitle: String(body.strikeTitle || ''),
+            updatedAt: Date.now(),
+          }
+        : null;
+      const db = readJsonSafe(DB_PATH);
+      const pendingInfo = db?.session ? getCurrentPendingObligations(db, Date.now()) : null;
+      updateTrayStatus(db, pendingInfo);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (pathname === '/api/daemon/tray-pomo-toggle' && req.method === 'POST') {
+      if (!livePomodoroTrayState?.active) {
+        await focusOrLaunchDesktopWindow(`http://127.0.0.1:${actualPort}`);
+        res.end(JSON.stringify({ ok: true, openedWindow: true }));
+        return;
+      }
+      pendingTrayAction = { id: Date.now(), type: 'TOGGLE_POMO' };
+      res.end(JSON.stringify({ ok: true, queued: true }));
       return;
     }
 
@@ -1359,6 +1824,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true }));
       flushShutdownTimestamps();
       if (watchdogTimer) clearInterval(watchdogTimer);
+      if (processGuardTimer) clearInterval(processGuardTimer);
       stopTrayHelper();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 500);
@@ -1399,7 +1865,10 @@ const server = http.createServer(async (req, res) => {
       isMonkModeLocked = Boolean(body?.isMonkModeOn);
       processGuardEnabled = Boolean(body?.processGuardEnabled);
       activeWhitelist = Array.isArray(body?.whitelistedApps) ? body.whitelistedApps : [];
-      res.end(JSON.stringify({ ok: true, isMonkModeLocked }));
+      if (isMonkModeLocked && processGuardEnabled) {
+        void enforceProcessGuardTick();
+      }
+      res.end(JSON.stringify({ ok: true, isMonkModeLocked, processGuardEnabled }));
       return;
     }
 
@@ -1482,6 +1951,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/backup/restore-portable' && req.method === 'POST') {
       const body = await readJsonBody(req);
+      if (body?.__payloadTooLarge) {
+        res.statusCode = 413;
+        res.end(JSON.stringify({ ok: false, error: 'Gói sao lưu vượt quá giới hạn 35MB.' }));
+        return;
+      }
       const result = restorePortableBackupBundle(body);
       if (!result.ok) {
         res.statusCode = 400;
@@ -1495,8 +1969,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const relPath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const filePath = path.join(DIST_DIR, relPath);
+  let relPath;
+  try {
+    relPath = decodeURIComponent(pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, ''));
+  } catch {
+    res.statusCode = 400;
+    res.end('Bad Request');
+    return;
+  }
+  const distRoot = path.resolve(DIST_DIR);
+  const filePath = path.resolve(distRoot, relPath);
+  if (filePath !== distRoot && !filePath.startsWith(distRoot + path.sep)) {
+    res.statusCode = 403;
+    res.end('Forbidden');
+    return;
+  }
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
     const ext = path.extname(filePath).toLowerCase();
     res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
@@ -1530,7 +2017,12 @@ function onDaemonListening(port) {
 
   watchdogTimer = setInterval(() => {
     runBackgroundEvaluation('watchdog');
+    void checkSmartIdleReturnHomeTick();
   }, 30000);
+
+  processGuardTimer = setInterval(() => {
+    void enforceProcessGuardTick();
+  }, 5000);
 
   if (!IS_BACKGROUND && !NO_WINDOW) {
     focusOrLaunchDesktopWindow(url);
@@ -1559,11 +2051,15 @@ server.on('error', async (err) => {
 
 process.on('SIGINT', () => {
   flushShutdownTimestamps();
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (processGuardTimer) clearInterval(processGuardTimer);
   stopTrayHelper();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   flushShutdownTimestamps();
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (processGuardTimer) clearInterval(processGuardTimer);
   stopTrayHelper();
   process.exit(0);
 });

@@ -51,6 +51,7 @@ import {
   WEEKDAY_ORDER,
 } from '../services/aiSchedulePlanner';
 import { TabPurposeBanner } from '../components/TabPurposeBanner';
+import { DurationHMInput, formatDurationHM } from '../components/DurationHMInput';
 
 type AIScheduleSubTab = 'TODAY_ACTION' | 'WEEK_EDITOR' | 'CONFIG_AI';
 
@@ -376,7 +377,8 @@ export const AIScheduleView: React.FC<AIScheduleViewProps> = ({
     deltaMins: number
   ) => {
     onPlayWoodenFish(0.5);
-    const nextMins = Math.max(10, Math.min(240, (slot.pomodoroMins || 30) + deltaMins));
+    const maxSlotMins = slot.kind === 'SLEEP' ? 16 * 60 : 8 * 60;
+    const nextMins = Math.max(5, Math.min(maxSlotMins, (slot.pomodoroMins || 30) + deltaMins));
     handleUpdateSlot(dayOfWeek, slot.id, { pomodoroMins: nextMins }, 'pomodoroMins');
   };
 
@@ -730,7 +732,7 @@ export const AIScheduleView: React.FC<AIScheduleViewProps> = ({
                             <div className="ai-slot-clock">
                               {slot.startTime} – {slot.endTime}
                             </div>
-                            <span className="pomo-pill">{slot.pomodoroMins} phút</span>
+                            <span className="pomo-pill">{formatDurationHM(slot.pomodoroMins)}</span>
                             {isNow && <span className="ai-now-live-pill">🔥 ĐANG TRONG GIỜ</span>}
                           </div>
 
@@ -1003,7 +1005,7 @@ export const AIScheduleView: React.FC<AIScheduleViewProps> = ({
                                   <span className="time-window-pill">
                                     {slot.startTime} – {slot.endTime}
                                   </span>
-                                  <span className="pomo-pill">{slot.pomodoroMins}p</span>
+                                  <span className="pomo-pill">{formatDurationHM(slot.pomodoroMins)}</span>
                                   <span className="zen-tag-red">
                                     {SLOT_KIND_LABELS[slot.kind].icon}{' '}
                                     {SLOT_KIND_LABELS[slot.kind].label}
@@ -1182,19 +1184,22 @@ export const AIScheduleView: React.FC<AIScheduleViewProps> = ({
                                   </div>
 
                                   <div>
-                                    <label className="zen-label">Thời lượng (phút)</label>
-                                    <input
-                                      type="number"
-                                      className="zen-input"
-                                      style={{ width: '100%' }}
-                                      min={5}
-                                      max={300}
-                                      value={slot.pomodoroMins}
-                                      onChange={(e) =>
+                                    <label className="zen-label">
+                                      Thời lượng (Tiếng &amp; Phút &rarr;{' '}
+                                      <strong style={{ color: '#A8D8C6' }}>
+                                        {formatDurationHM(slot.pomodoroMins)}
+                                      </strong>
+                                      )
+                                    </label>
+                                    <DurationHMInput
+                                      valueMins={slot.pomodoroMins}
+                                      minMins={5}
+                                      maxHours={slot.kind === 'SLEEP' ? 16 : 8}
+                                      onChangeMins={(nextMins) =>
                                         handleUpdateSlot(
                                           editorDayPlan.dayOfWeek,
                                           slot.id,
-                                          { pomodoroMins: Number(e.target.value) },
+                                          { pomodoroMins: nextMins },
                                           'pomodoroMins'
                                         )
                                       }

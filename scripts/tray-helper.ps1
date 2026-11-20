@@ -7,6 +7,14 @@
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class TrayNativeIcon {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+}
+"@
 
 function New-MountainIcon {
     $bmp = New-Object System.Drawing.Bitmap 32, 32
@@ -40,7 +48,12 @@ function New-MountainIcon {
     $peakBrush.Dispose()
 
     $hIcon = $bmp.GetHicon()
-    return [System.Drawing.Icon]::FromHandle($hIcon)
+    $rawIcon = [System.Drawing.Icon]::FromHandle($hIcon)
+    $cloned = $rawIcon.Clone()
+    $rawIcon.Dispose()
+    [TrayNativeIcon]::DestroyIcon($hIcon) | Out-Null
+    $bmp.Dispose()
+    return $cloned
 }
 
 function Invoke-ApiPost {
@@ -79,6 +92,16 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $itemStatus = New-Object System.Windows.Forms.ToolStripMenuItem 'Trạng thái: Đang theo dõi...'
 $itemStatus.Enabled = $false
 
+$itemWorkReturn = New-Object System.Windows.Forms.ToolStripMenuItem '🏠 Xác Nhận Đã Đi Làm Về Ngay'
+$itemWorkReturn.Add_Click({
+    Invoke-ApiPost '/api/daemon/confirm-work-return'
+})
+
+$itemPomoToggle = New-Object System.Windows.Forms.ToolStripMenuItem '⏱️ Bật / Tạm Dừng Pomodoro'
+$itemPomoToggle.Add_Click({
+    Invoke-ApiPost '/api/daemon/tray-pomo-toggle'
+})
+
 $itemOpen = New-Object System.Windows.Forms.ToolStripMenuItem 'Mở Cửa Sổ App Lên Núi'
 $itemOpen.Font = New-Object System.Drawing.Font($itemOpen.Font, [System.Drawing.FontStyle]::Bold)
 $itemOpen.Add_Click({
@@ -106,6 +129,9 @@ $itemQuit.Add_Click({
 })
 
 $menu.Items.Add($itemStatus) | Out-Null
+$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$menu.Items.Add($itemWorkReturn) | Out-Null
+$menu.Items.Add($itemPomoToggle) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $menu.Items.Add($itemOpen) | Out-Null
 $menu.Items.Add($itemCheck) | Out-Null
@@ -142,6 +168,12 @@ $timer.Add_Tick({
         }
         if ($st.menuLabel) {
             $itemStatus.Text = [string]$st.menuLabel
+        }
+        if ($st.workShiftMenuLabel) {
+            $itemWorkReturn.Text = [string]$st.workShiftMenuLabel
+        }
+        if ($st.pomoMenuLabel) {
+            $itemPomoToggle.Text = [string]$st.pomoMenuLabel
         }
     }
 

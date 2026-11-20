@@ -1587,7 +1587,7 @@ html, body {
   inset: 0;
   z-index: 2000;
   background: linear-gradient(rgba(18, 19, 20, 0.55), rgba(18, 19, 20, 0.85)),
-    url('./assets/shanshui-mountains.jpg') center/cover no-repeat;
+    url('/assets/shanshui-mountains.jpg') center/cover no-repeat;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6724,4 +6724,90 @@ html, body {
   font-size: 12.5px;
   color: #b8b4a9;
   font-weight: 600;
+}
+
+.hm-input-pair.is-compact .hm-num-field {
+  width: 54px;
+  padding: 5px 6px;
+}
+
+.hm-duration-preview-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 12px !important;
+  font-weight: 700 !important;
+  background: rgba(91, 174, 147, 0.2);
+  border: 1px solid rgba(91, 174, 147, 0.45);
+  color: #a8d8c6 !important;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   FOCUS CHAMBER 2.0 (FLOWTIME, OVERTIME & PIP) + RETURN HOME BANNER
+   ============================================================ */
+.focus-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(246, 244, 238, 0.1);
+}
+
+.focus-overtime-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(240, 200, 120, 0.32);
+  background: rgba(240, 200, 120, 0.08);
+  color: #f0c878;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.focus-pomo-circle.is-overtime-flow {
+  border-color: rgba(240, 200, 120, 0.72);
+  background: radial-gradient(circle at top, rgba(72, 52, 16, 0.45), rgba(14, 16, 17, 0.92));
+  box-shadow: 0 0 28px rgba(240, 200, 120, 0.2);
+}
+
+.focus-pomo-circle.is-flowtime-mode {
+  border-color: rgba(77, 208, 225, 0.52);
+  background: radial-gradient(circle at top, rgba(16, 48, 58, 0.45), rgba(14, 16, 17, 0.92));
+}
+
+.focus-overtime-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(240, 200, 120, 0.2);
+  border: 1px solid rgba(240, 200, 120, 0.65);
+  color: #f0c878;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+
+.return-home-suggest-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 14px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(240, 200, 120, 0.65);
+  background: linear-gradient(135deg, rgba(64, 48, 16, 0.62), rgba(20, 32, 29, 0.78));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
 }

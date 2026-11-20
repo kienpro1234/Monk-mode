@@ -1,4 +1,4 @@
-import {
+import type {
   MonkDatabaseSchema,
   MountainLawConfig,
   ViolationRecord,
@@ -7,7 +7,14 @@ import {
   WorkShiftMode,
   OfflineGapReport,
 } from '../types/models';
-import { getTodayDateStr } from './defaultData';
+
+export function getTodayDateStr(nowMs: number = Date.now()): string {
+  const d = new Date(nowMs);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
 
 /* =============================================================================
    BỘ LUẬT NÚI — HỆ THỐNG TỰ ĐỘNG XÉT DUYỆT VI PHẠM
@@ -762,5 +769,31 @@ export function evaluateDayImmediately(
     newViolations,
     evaluatedDays: [dateStr],
     cleanDays,
+  };
+}
+
+export function getCurrentPendingObligations(
+  db: MonkDatabaseSchema,
+  nowMs: number = Date.now()
+): {
+  shiftDateStr: string;
+  cutoffMs: number;
+  minutesLeft: number;
+  findings: LawFinding[];
+} {
+  if (!db || !db.session) {
+    return { shiftDateStr: getTodayDateStr(nowMs), cutoffMs: nowMs, minutesLeft: 0, findings: [] };
+  }
+  const config = getLawConfig(db);
+  const nightStartTime = getEffectiveNightStartTime(config);
+  const shiftDateStr = getShiftDateStr(nowMs, config.workShiftMode, nightStartTime);
+  const cutoffMs = getShiftEndOfDayMs(shiftDateStr, config.workShiftMode, nightStartTime);
+  const minutesLeft = Math.max(0, Math.floor((cutoffMs - nowMs) / 60000));
+  const findings = findDayViolations(db, shiftDateStr, config);
+  return {
+    shiftDateStr,
+    cutoffMs,
+    minutesLeft,
+    findings,
   };
 }

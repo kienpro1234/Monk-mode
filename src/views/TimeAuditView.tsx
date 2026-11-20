@@ -40,6 +40,8 @@ import {
   TimeAuditRangeMode,
 } from '../services/timeAuditEngine';
 import { TabPurposeBanner } from '../components/TabPurposeBanner';
+import { DurationHMInput, formatDurationHM } from '../components/DurationHMInput';
+import { SuggestedReturnHomeInfo } from '../services/desktopBridge';
 
 type TimeAuditSubTab = 'TODAY_REALTIME' | 'CHARTS' | 'WEEKLY_REVIEW';
 
@@ -51,6 +53,8 @@ interface TimeAuditViewProps {
   dayShiftStartTime: string;
   nightShiftStartTime: string;
   liveActiveSession: LiveActiveSessionInput | null;
+  suggestedReturnHome?: SuggestedReturnHomeInfo | null;
+  onDismissReturnHomeSuggestion?: (shiftDateStr: string) => void;
   onAddManualTimeLog: (params: {
     date: string;
     activityType: TodoActivityType;
@@ -65,13 +69,7 @@ interface TimeAuditViewProps {
   onSelectGoal: (goalId: string) => void;
 }
 
-function formatMinsHuman(mins: number): string {
-  const m = Math.max(0, Math.round(mins));
-  if (m < 60) return `${m}p`;
-  const h = Math.floor(m / 60);
-  const r = m % 60;
-  return r === 0 ? `${h}h` : `${h}h ${r}p`;
-}
+const formatMinsHuman = formatDurationHM;
 
 export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
   db,
@@ -81,6 +79,8 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
   dayShiftStartTime,
   nightShiftStartTime,
   liveActiveSession,
+  suggestedReturnHome,
+  onDismissReturnHomeSuggestion,
   onAddManualTimeLog,
   onDeleteTimeLog,
   onUpdateTimeAuditConfig,
@@ -98,8 +98,7 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
   // Manual quick log form (giờ + phút)
   const [manualType, setManualType] = useState<TodoActivityType>('WORK_SHIFT');
   const [manualTitle, setManualTitle] = useState('');
-  const [manualHours, setManualHours] = useState(1);
-  const [manualMinsPart, setManualMinsPart] = useState(0);
+  const [manualTotalMins, setManualTotalMins] = useState<number>(60);
   const [manualDate, setManualDate] = useState(todayStr);
 
   // Work shift check-in & transparent formula drafts
@@ -117,8 +116,9 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
   const [manualWorkInputMode, setManualWorkInputMode] = useState<'CLOCK_RANGE' | 'DURATION_HM'>(
     'CLOCK_RANGE'
   );
-  const [manualWorkHours, setManualWorkHours] = useState<number>(8);
-  const [manualWorkMins, setManualWorkMins] = useState<number>(0);
+  const [manualWorkTotalMins, setManualWorkTotalMins] = useState<number>(
+    existingWorkRecord?.workDurationMins ?? 480
+  );
   const [showManualWorkEditor, setShowManualWorkEditor] = useState<boolean>(false);
   const [includePrepLockDraft, setIncludePrepLockDraft] = useState<boolean>(
     existingWorkRecord ? (existingWorkRecord.prepLockMins ?? 60) > 0 : true
@@ -126,13 +126,8 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
   const [useCustomSleepDraft, setUseCustomSleepDraft] = useState<boolean>(
     existingWorkRecord?.sleepOverrideMins !== undefined
   );
-  const [customSleepHoursDraft, setCustomSleepHoursDraft] = useState<number>(
-    existingWorkRecord?.sleepOverrideMins !== undefined
-      ? Math.floor(existingWorkRecord.sleepOverrideMins / 60)
-      : 6
-  );
-  const [customSleepMinsDraft, setCustomSleepMinsDraft] = useState<number>(
-    existingWorkRecord?.sleepOverrideMins !== undefined ? existingWorkRecord.sleepOverrideMins % 60 : 0
+  const [customSleepTotalMins, setCustomSleepTotalMins] = useState<number>(
+    existingWorkRecord?.sleepOverrideMins ?? 360
   );
 
   useEffect(() => {
@@ -143,13 +138,16 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
           ? db.climbingSchedulePlan?.nightReturnHomeTime || '07:30'
           : '17:30'
       );
+    } else {
+      setManualWorkTotalMins(existingWorkRecord.workDurationMins ?? 480);
+      if (existingWorkRecord.sleepOverrideMins !== undefined) {
+        setUseCustomSleepDraft(true);
+        setCustomSleepTotalMins(existingWorkRecord.sleepOverrideMins);
+      }
     }
   }, [defaultWorkStart, activeShiftMode, existingWorkRecord, db.climbingSchedulePlan?.nightReturnHomeTime]);
 
-  const totalManualLogMins = useMemo(
-    () => Math.max(0, Math.round((manualHours || 0) * 60 + (manualMinsPart || 0))),
-    [manualHours, manualMinsPart]
-  );
+  const totalManualLogMins = manualTotalMins;
 
   const nowArrivalInfo = useMemo(() => {
     const nowD = new Date(nowTick);
@@ -166,10 +164,10 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
 
   const manualWorkComputedMins = useMemo(() => {
     if (manualWorkInputMode === 'DURATION_HM') {
-      return Math.max(0, Math.min(18 * 60, Math.round((manualWorkHours || 0) * 60 + (manualWorkMins || 0))));
+      return Math.max(0, Math.min(18 * 60 + 59, Math.round(manualWorkTotalMins || 0)));
     }
     return computeWorkShiftDurationMins(workStartDraft, workEndDraft);
-  }, [manualWorkInputMode, manualWorkHours, manualWorkMins, workStartDraft, workEndDraft]);
+  }, [manualWorkInputMode, manualWorkTotalMins, workStartDraft, workEndDraft]);
 
   // Weekly AI critique state
   const [aiCoachResult, setAiCoachResult] = useState<{
@@ -361,8 +359,13 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
               const bb = todayAudit.budgetBreakdown;
               const buildSleepOverride = () =>
                 useCustomSleepDraft
-                  ? Math.max(0, Math.round((customSleepHoursDraft || 0) * 60 + (customSleepMinsDraft || 0)))
+                  ? Math.max(0, Math.round(customSleepTotalMins || 0))
                   : undefined;
+
+              const hasReturnSuggestion =
+                suggestedReturnHome &&
+                suggestedReturnHome.shiftDateStr === todayStr &&
+                !bb.hasConfirmedWorkShift;
 
               return (
                 <div
@@ -370,6 +373,52 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                     bb.hasConfirmedWorkShift ? 'is-confirmed' : 'is-awaiting'
                   }`}
                 >
+                  {hasReturnSuggestion && (
+                    <div className="return-home-suggest-banner">
+                      <div style={{ flex: 1, minWidth: 220 }}>
+                        <strong style={{ color: '#f0c878', fontSize: 13.5 }}>
+                          ✨ Tự động phát hiện bạn vừa đi làm về lúc {suggestedReturnHome.detectedHHMM}!
+                        </strong>
+                        <div style={{ fontSize: 12, color: '#d6d2c6', marginTop: 2 }}>
+                          Ca {suggestedReturnHome.shiftMode === 'NIGHT' ? 'Đêm' : 'Ngày'} từ{' '}
+                          <strong>{suggestedReturnHome.workStartTime}</strong> &rarr;{' '}
+                          <strong>{suggestedReturnHome.detectedHHMM}</strong> (={' '}
+                          <strong>{formatMinsHuman(suggestedReturnHome.estimatedWorkMins)}</strong>)
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="zen-btn zen-btn-seal"
+                          style={{ fontSize: 12, padding: '6px 12px' }}
+                          onClick={() => {
+                            onConfirmWorkShift({
+                              date: todayStr,
+                              shiftMode: suggestedReturnHome.shiftMode,
+                              workStartTime: suggestedReturnHome.workStartTime,
+                              workEndTime: suggestedReturnHome.detectedHHMM,
+                              workEndMs: suggestedReturnHome.detectedAtMs,
+                              workDurationMins: suggestedReturnHome.estimatedWorkMins,
+                              prepLockMins: 60,
+                              sleepOverrideMins: buildSleepOverride(),
+                              confirmedAt: Date.now(),
+                            });
+                            onDismissReturnHomeSuggestion?.(todayStr);
+                          }}
+                        >
+                          <Check size={14} /> Chốt Đúng Giờ Này
+                        </button>
+                        <button
+                          type="button"
+                          className="zen-btn zen-btn-ghost"
+                          style={{ fontSize: 11.5, padding: '5px 8px' }}
+                          onClick={() => onDismissReturnHomeSuggestion?.(todayStr)}
+                        >
+                          Bỏ qua
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="section-header-row" style={{ marginBottom: 10 }}>
                     <div>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -546,28 +595,12 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                             ) : (
                               <div>
                                 <label className="zen-label">Tổng thời gian đi làm (Tiếng + Phút)</label>
-                                <div className="hm-input-pair">
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    max={18}
-                                    className="zen-input"
-                                    value={manualWorkHours}
-                                    onChange={(e) => setManualWorkHours(Math.max(0, Number(e.target.value)))}
-                                  />
-                                  <span>tiếng</span>
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    max={59}
-                                    className="zen-input"
-                                    value={manualWorkMins}
-                                    onChange={(e) =>
-                                      setManualWorkMins(Math.max(0, Math.min(59, Number(e.target.value))))
-                                    }
-                                  />
-                                  <span>phút</span>
-                                </div>
+                                <DurationHMInput
+                                  valueMins={manualWorkTotalMins}
+                                  minMins={0}
+                                  maxHours={18}
+                                  onChangeMins={setManualWorkTotalMins}
+                                />
                               </div>
                             )}
 
@@ -580,7 +613,7 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                                     checked={includePrepLockDraft}
                                     onChange={(e) => setIncludePrepLockDraft(e.target.checked)}
                                   />
-                                  Trừ 1 tiếng (60p) chuẩn bị trước khi đi làm
+                                  Trừ 1 tiếng (1h) chuẩn bị trước khi đi làm
                                 </label>
                                 <label style={{ fontSize: 12, color: '#d0ccc0', display: 'flex', gap: 6, alignItems: 'center' }}>
                                   <input
@@ -591,32 +624,12 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                                   Chỉnh riêng giờ ngủ hôm nay (thay cho Lịch AI)
                                 </label>
                                 {useCustomSleepDraft && (
-                                  <div className="hm-input-pair">
-                                    <input
-                                      type="number"
-                                      min={0}
-                                      max={14}
-                                      className="zen-input"
-                                      value={customSleepHoursDraft}
-                                      onChange={(e) =>
-                                        setCustomSleepHoursDraft(Math.max(0, Number(e.target.value)))
-                                      }
-                                    />
-                                    <span>h</span>
-                                    <input
-                                      type="number"
-                                      min={0}
-                                      max={59}
-                                      className="zen-input"
-                                      value={customSleepMinsDraft}
-                                      onChange={(e) =>
-                                        setCustomSleepMinsDraft(
-                                          Math.max(0, Math.min(59, Number(e.target.value)))
-                                        )
-                                      }
-                                    />
-                                    <span>p ngủ</span>
-                                  </div>
+                                  <DurationHMInput
+                                    valueMins={customSleepTotalMins}
+                                    minMins={0}
+                                    maxHours={16}
+                                    onChangeMins={setCustomSleepTotalMins}
+                                  />
                                 )}
                               </div>
                             </div>
@@ -653,27 +666,25 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                   {/* Explicit Transparent Formula Strip */}
                   <div className="time-formula-box">
                     <div className="time-formula-chips">
-                      <span className="time-formula-chip base">🕛 24h (1440p)</span>
+                      <span className="time-formula-chip base">🕛 24h</span>
                       <span className="formula-op">−</span>
                       <span className="time-formula-chip sleep">
-                        🛏️ Ngủ {formatMinsHuman(bb.sleepMins)} ({bb.sleepMins}p
-                        {bb.sleepSource === 'AI_SCHEDULE' ? ' • từ Lịch AI' : ''})
+                        🛏️ Ngủ {formatMinsHuman(bb.sleepMins)}
+                        {bb.sleepSource === 'AI_SCHEDULE' ? ' (từ Lịch AI)' : ''}
                       </span>
                       <span className="formula-op">−</span>
                       <span className="time-formula-chip work">
                         💼 Đi làm{' '}
-                        {bb.hasConfirmedWorkShift
-                          ? `${formatMinsHuman(bb.workMins)} (${bb.workMins}p)`
-                          : 'Chờ chốt...'}
+                        {bb.hasConfirmedWorkShift ? formatMinsHuman(bb.workMins) : 'Chờ chốt...'}
                       </span>
                       <span className="formula-op">−</span>
                       <span className="time-formula-chip prep">
-                        🎒 Khóa chuẩn bị {formatMinsHuman(bb.prepLockMins)} ({bb.prepLockMins}p)
+                        🎒 Khóa chuẩn bị {formatMinsHuman(bb.prepLockMins)}
                       </span>
                       <span className="formula-op">=</span>
                       <span className="time-formula-chip result">
                         {bb.hasConfirmedWorkShift
-                          ? `🟢 Quỹ Rảnh Cả Ngày: ${formatMinsHuman(bb.fullDayFreeBudgetMins)} (${bb.fullDayFreeBudgetMins}p)`
+                          ? `🟢 Quỹ Rảnh Cả Ngày: ${formatMinsHuman(bb.fullDayFreeBudgetMins)}`
                           : '⏳ Chờ xác nhận đi làm'}
                       </span>
                     </div>
@@ -748,66 +759,48 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
               <div className="time-audit-budget-panel">
                 <div className="ai-editor-form-grid">
                   <div>
-                    <label className="zen-label">Giờ ngủ / ngày (h)</label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      min={4}
-                      max={12}
-                      className="zen-input"
-                      style={{ width: '100%' }}
-                      value={auditCfg.sleepHoursPerDay}
-                      onChange={(e) =>
-                        onUpdateTimeAuditConfig({ sleepHoursPerDay: Number(e.target.value) })
+                    <label className="zen-label">Giờ ngủ mặc định / ngày</label>
+                    <DurationHMInput
+                      valueMins={Math.round(auditCfg.sleepHoursPerDay * 60)}
+                      minMins={60}
+                      maxHours={14}
+                      onChangeMins={(m) =>
+                        onUpdateTimeAuditConfig({ sleepHoursPerDay: Number((m / 60).toFixed(2)) })
                       }
                     />
                   </div>
                   <div>
-                    <label className="zen-label">Giờ đi làm ca / ngày (h)</label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      min={0}
-                      max={14}
-                      className="zen-input"
-                      style={{ width: '100%' }}
-                      value={auditCfg.workShiftHoursPerDay}
-                      onChange={(e) =>
-                        onUpdateTimeAuditConfig({ workShiftHoursPerDay: Number(e.target.value) })
+                    <label className="zen-label">Giờ đi làm ca mặc định / ngày</label>
+                    <DurationHMInput
+                      valueMins={Math.round(auditCfg.workShiftHoursPerDay * 60)}
+                      minMins={0}
+                      maxHours={16}
+                      onChangeMins={(m) =>
+                        onUpdateTimeAuditConfig({ workShiftHoursPerDay: Number((m / 60).toFixed(2)) })
                       }
                     />
                   </div>
                   <div>
-                    <label className="zen-label">Sinh hoạt cố định (ăn/tắm) (h)</label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      min={0.5}
-                      max={6}
-                      className="zen-input"
-                      style={{ width: '100%' }}
-                      value={auditCfg.essentialRoutineHoursPerDay}
-                      onChange={(e) =>
+                    <label className="zen-label">Sinh hoạt cố định (ăn/tắm)</label>
+                    <DurationHMInput
+                      valueMins={Math.round(auditCfg.essentialRoutineHoursPerDay * 60)}
+                      minMins={15}
+                      maxHours={6}
+                      onChangeMins={(m) =>
                         onUpdateTimeAuditConfig({
-                          essentialRoutineHoursPerDay: Number(e.target.value),
+                          essentialRoutineHoursPerDay: Number((m / 60).toFixed(2)),
                         })
                       }
                     />
                   </div>
                   <div>
-                    <label className="zen-label">Mục tiêu tập trung cao (phút/ngày)</label>
-                    <input
-                      type="number"
-                      step={15}
-                      min={30}
-                      max={720}
-                      className="zen-input"
-                      style={{ width: '100%' }}
-                      value={auditCfg.dailyTargetProductiveMins}
-                      onChange={(e) =>
-                        onUpdateTimeAuditConfig({
-                          dailyTargetProductiveMins: Number(e.target.value),
-                        })
+                    <label className="zen-label">Mục tiêu tập trung cao / ngày</label>
+                    <DurationHMInput
+                      valueMins={auditCfg.dailyTargetProductiveMins}
+                      minMins={15}
+                      maxHours={14}
+                      onChangeMins={(m) =>
+                        onUpdateTimeAuditConfig({ dailyTargetProductiveMins: Math.max(15, m) })
                       }
                     />
                   </div>
@@ -1138,30 +1131,17 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                   <label className="zen-label">
                     Thời lượng (Giờ + Phút) &rarr;{' '}
                     <strong style={{ color: '#A8D8C6' }}>
-                      {formatMinsHuman(totalManualLogMins)} ({totalManualLogMins}p)
+                      {formatMinsHuman(totalManualLogMins)}
                     </strong>
                   </label>
-                  <div className="hm-input-pair" style={{ marginBottom: 6 }}>
-                    <input
-                      type="number"
-                      className="zen-input"
-                      min={0}
-                      max={24}
-                      value={manualHours}
-                      onChange={(e) => setManualHours(Math.max(0, Math.min(24, Number(e.target.value))))}
+                  <div style={{ marginBottom: 6 }}>
+                    <DurationHMInput
+                      valueMins={manualTotalMins}
+                      minMins={1}
+                      maxHours={24}
+                      showPreviewBadge={false}
+                      onChangeMins={setManualTotalMins}
                     />
-                    <span>tiếng</span>
-                    <input
-                      type="number"
-                      className="zen-input"
-                      min={0}
-                      max={59}
-                      value={manualMinsPart}
-                      onChange={(e) =>
-                        setManualMinsPart(Math.max(0, Math.min(59, Number(e.target.value))))
-                      }
-                    />
-                    <span>phút</span>
                   </div>
                   <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                     {[15, 30, 45, 60, 90, 120, 240, 480].map((m) => (
@@ -1169,10 +1149,7 @@ export const TimeAuditView: React.FC<TimeAuditViewProps> = ({
                         key={m}
                         type="button"
                         className={`pomo-preset-btn ${totalManualLogMins === m ? 'active' : ''}`}
-                        onClick={() => {
-                          setManualHours(Math.floor(m / 60));
-                          setManualMinsPart(m % 60);
-                        }}
+                        onClick={() => setManualTotalMins(m)}
                       >
                         {formatMinsHuman(m)}
                       </button>

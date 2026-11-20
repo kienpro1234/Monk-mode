@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Check,
@@ -7,13 +7,16 @@ import {
   Image as ImageIcon,
   Lightbulb,
   Pause,
+  PictureInPicture2,
   Play,
   Plus,
   RotateCcw,
+  Timer,
   ToggleLeft,
   ToggleRight,
   Upload,
   Volume2,
+  Waves,
   Zap,
 } from 'lucide-react';
 import {
@@ -23,6 +26,8 @@ import {
   TodoActivityType,
 } from '../types/models';
 import { WoodblockSealSvg } from '../components/WoodblockSealSvg';
+import { formatDurationHM } from '../components/DurationHMInput';
+import { FloatingPipTimerController } from '../utils/floatingPipTimer';
 import { resolveProofImageUrl } from '../services/desktopBridge';
 import { ACTIVITY_TYPE_META, ALL_ACTIVITY_TYPES } from '../services/timeAuditEngine';
 import { AmbientSoundMode } from '../utils/soundEngine';
@@ -31,9 +36,13 @@ interface FocusChamberViewProps {
   focusedStrike: DailyStrikeTodoEntity;
   focusIsSideQuest: boolean;
   focusContextTitle: string;
+  timerMode: 'POMODORO' | 'FLOWTIME';
+  allowFlowOvertime: boolean;
   pomoSecondsLeft: number;
   pomoTotalSeconds: number;
   pomoRunning: boolean;
+  overtimeSeconds: number;
+  flowElapsedSeconds: number;
   pomoSelectedMins: number;
   activityType: TodoActivityType;
   ambientMode: AmbientSoundMode;
@@ -42,6 +51,9 @@ interface FocusChamberViewProps {
   breakTotalSeconds: number;
   pinnedOptimizationNotes: OptimizationNoteEntity[];
   onExitFocus: () => void;
+  onChangeTimerMode: (mode: 'POMODORO' | 'FLOWTIME') => void;
+  onToggleAllowFlowOvertime: () => void;
+  onExtendPomoMinutes: (deltaMins: number) => void;
   onSelectDuration: (mins: number) => void;
   onToggleRun: () => void;
   onResetTimer: () => void;
@@ -65,13 +77,28 @@ interface FocusChamberViewProps {
   onZoomPhoto: (photo: { uri: string; title: string; caption: string; dateStr: string }) => void;
 }
 
+function formatClockMMSS(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const remS = s % 60;
+  if (hrs > 0) {
+    return `${hrs}:${String(mins).padStart(2, '0')}:${String(remS).padStart(2, '0')}`;
+  }
+  return `${String(mins).padStart(2, '0')}:${String(remS).padStart(2, '0')}`;
+}
+
 export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
   focusedStrike,
   focusIsSideQuest,
   focusContextTitle,
+  timerMode,
+  allowFlowOvertime,
   pomoSecondsLeft,
   pomoTotalSeconds,
   pomoRunning,
+  overtimeSeconds,
+  flowElapsedSeconds,
   pomoSelectedMins,
   activityType,
   ambientMode,
@@ -80,6 +107,9 @@ export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
   breakTotalSeconds,
   pinnedOptimizationNotes,
   onExitFocus,
+  onChangeTimerMode,
+  onToggleAllowFlowOvertime,
+  onExtendPomoMinutes,
   onSelectDuration,
   onToggleRun,
   onResetTimer,
@@ -103,11 +133,88 @@ export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
   const [quickIdeaCategory, setQuickIdeaCategory] =
     useState<OptimizationCategory>('COMBO_TIME_SAVER');
   const [quickIdeaSavedHint, setQuickIdeaSavedHint] = useState('');
+  const [isPipOpen, setIsPipOpen] = useState(false);
 
-  const elapsedSeconds = Math.max(0, pomoTotalSeconds - pomoSecondsLeft);
+  const pipControllerRef = useRef<FloatingPipTimerController | null>(null);
+  if (!pipControllerRef.current) {
+    pipControllerRef.current = new FloatingPipTimerController();
+  }
+
+  const elapsedSeconds =
+    timerMode === 'FLOWTIME'
+      ? flowElapsedSeconds
+      : Math.max(0, pomoTotalSeconds - pomoSecondsLeft) + overtimeSeconds;
   const elapsedActualMins =
     elapsedSeconds > 0 ? Math.max(1, Math.round(elapsedSeconds / 60)) : 0;
-  const isPausedMidSession = !pomoRunning && elapsedSeconds > 0;
+  const isOvertime = timerMode === 'POMODORO' && overtimeSeconds > 0;
+  const isPausedMidSession =
+    !pomoRunning &&
+    (timerMode === 'FLOWTIME' ? flowElapsedSeconds > 0 : elapsedSeconds > 0);
+  const clockText =
+    timerMode === 'FLOWTIME'
+      ? formatClockMMSS(flowElapsedSeconds)
+      : isOvertime
+      ? `+${formatClockMMSS(overtimeSeconds)}`
+      : formatClockMMSS(pomoSecondsLeft);
+  const progressPct =
+    timerMode === 'FLOWTIME'
+      ? Math.min(100, Math.round((flowElapsedSeconds / (45 * 60)) * 100))
+      : isOvertime
+      ? 100
+      : Math.min(
+          100,
+          Math.round(((pomoTotalSeconds - pomoSecondsLeft) / Math.max(1, pomoTotalSeconds)) * 100)
+        );
+  const pipSubText = isOvertime
+    ? `Tổng ${formatDurationHM(elapsedActualMins)} (vượt giờ)`
+    : timerMode === 'FLOWTIME'
+    ? `Đã chạy ${formatDurationHM(elapsedActualMins)}`
+    : `${elapsedActualMins}p / ${pomoSelectedMins}p`;
+
+  const pipSnapshot = {
+    strikeTitle: focusedStrike.title,
+    mode: timerMode,
+    running: pomoRunning,
+    isOvertime,
+    clockText,
+    subText: pipSubText,
+    progressPct,
+  };
+
+  useEffect(() => {
+    if (isPipOpen && pipControllerRef.current) {
+      pipControllerRef.current.setCallbacks({
+        onToggleRun,
+        onExtend10: () => onExtendPomoMinutes(10),
+        onFinishSession: onFinishActualSession,
+        onClosed: () => setIsPipOpen(false),
+      });
+      pipControllerRef.current.update(pipSnapshot);
+    }
+  });
+
+  useEffect(() => {
+    return () => {
+      pipControllerRef.current?.close();
+    };
+  }, []);
+
+  const handleTogglePip = async () => {
+    const ctrl = pipControllerRef.current;
+    if (!ctrl) return;
+    if (ctrl.isOpen()) {
+      ctrl.close();
+      setIsPipOpen(false);
+      return;
+    }
+    const ok = await ctrl.open(pipSnapshot, {
+      onToggleRun,
+      onExtend10: () => onExtendPomoMinutes(10),
+      onFinishSession: onFinishActualSession,
+      onClosed: () => setIsPipOpen(false),
+    });
+    setIsPipOpen(ok);
+  };
   return (
     <div className="zen-card single-task-focus-chamber">
       <div className="focus-chamber-topbar">
@@ -167,44 +274,103 @@ export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
             </div>
           </div>
 
-          {/* Interactive Timestamp-Anchored Pomodoro Timer */}
+          {/* Interactive Timestamp-Anchored Pomodoro & Flowtime 2.0 Arena */}
           <div className="focus-pomodoro-arena">
-            <div className="focus-pomo-duration-selector">
-              <span>Chọn thời lượng hiệp Pomodoro:</span>
-              {[5, 10, 15, 25, 35, 45, 50, 60, 90].map((mins) => (
+            {/* Focus 2.0 Mode Switcher + Floating PiP Widget Toggle */}
+            <div className="focus-mode-bar">
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 <button
-                  key={mins}
                   type="button"
-                  className={`pomo-preset-btn ${pomoSelectedMins === mins ? 'active' : ''}`}
-                  onClick={() => onSelectDuration(mins)}
+                  className={`pomo-preset-btn ${timerMode === 'POMODORO' ? 'active' : ''}`}
+                  onClick={() => onChangeTimerMode('POMODORO')}
+                  title="Đếm ngược theo hiệp cố định (có thể đếm vượt giờ Flow nếu chưa muốn nghỉ)"
                 >
-                  {mins}p
+                  <Timer size={13} style={{ display: 'inline', marginRight: 4 }} />
+                  Pomodoro (Đếm ngược)
                 </button>
-              ))}
+                <button
+                  type="button"
+                  className={`pomo-preset-btn ${timerMode === 'FLOWTIME' ? 'active' : ''}`}
+                  onClick={() => onChangeTimerMode('FLOWTIME')}
+                  title="Đếm tiến tự do — giữ trọn mạch tập trung sâu, chốt lúc nào tính đúng bấy nhiêu phút"
+                >
+                  <Waves size={13} style={{ display: 'inline', marginRight: 4 }} />
+                  Flowtime (Đếm tiến tự do)
+                </button>
+              </div>
+
+              <button
+                type="button"
+                className={`pomo-preset-btn ${isPipOpen ? 'active' : ''}`}
+                onClick={() => void handleTogglePip()}
+                title="Bật đồng hồ mini nổi luôn ở góc màn hình khi chuyển sang app/tab khác"
+              >
+                <PictureInPicture2 size={13} style={{ display: 'inline', marginRight: 4 }} />
+                {isPipOpen ? 'Đang Mở Đồng Hồ Nổi' : '📌 Đồng Hồ Nổi Góc Màn Hình'}
+              </button>
             </div>
 
-            <div className="focus-pomo-circle">
-              <div className="focus-pomo-digits">
-                {String(Math.floor(pomoSecondsLeft / 60)).padStart(2, '0')}:
-                {String(pomoSecondsLeft % 60).padStart(2, '0')}
+            {timerMode === 'POMODORO' && (
+              <div className="focus-pomo-duration-selector">
+                <span>Thời lượng hiệp:</span>
+                {[5, 10, 15, 25, 35, 45, 50, 60, 90].map((mins) => (
+                  <button
+                    key={mins}
+                    type="button"
+                    className={`pomo-preset-btn ${pomoSelectedMins === mins ? 'active' : ''}`}
+                    onClick={() => onSelectDuration(mins)}
+                  >
+                    {mins}p
+                  </button>
+                ))}
+                <label className="focus-overtime-toggle" title="Khi hết giờ Pomodoro, rung chuông nhẹ nhưng tự đếm vượt giờ thay vì dừng ép">
+                  <input
+                    type="checkbox"
+                    checked={allowFlowOvertime}
+                    onChange={onToggleAllowFlowOvertime}
+                  />
+                  <span>🌊 Đếm vượt giờ Flow khi hết hiệp</span>
+                </label>
               </div>
+            )}
+
+            <div
+              className={`focus-pomo-circle ${isOvertime ? 'is-overtime-flow' : ''} ${
+                timerMode === 'FLOWTIME' ? 'is-flowtime-mode' : ''
+              }`}
+            >
+              {isOvertime && (
+                <span className="focus-overtime-pill">
+                  🌊 ĐANG VƯỢT GIỜ FLOW (ĐÃ XONG {pomoSelectedMins}p CHÍNH)
+                </span>
+              )}
+              <div className="focus-pomo-digits">{clockText}</div>
               <div className="focus-pomo-sub">
-                {pomoRunning
+                {timerMode === 'FLOWTIME'
+                  ? pomoRunning
+                    ? `🌊 Mạch Flow tự do đang chạy (tổng ${elapsedActualMins}p thực tế — gợi ý nghỉ ~${Math.max(
+                        5,
+                        Math.min(20, Math.round(elapsedActualMins / 5))
+                      )}p sau khi chốt)`
+                    : isPausedMidSession
+                    ? `⏸ Đang tạm dừng Flowtime — đã tích lũy ${elapsedActualMins}p trong hiệp này`
+                    : '🌊 Flowtime đếm tiến từ 00:00 — tập trung liền mạch không lo bị ngắt quãng giữa chừng!'
+                  : isOvertime
+                  ? `🔥 Tuyệt vời! Tổng thời gian thực tế hiệp này đang là ${elapsedActualMins} phút — bấm "Chốt hiệp" bất cứ lúc nào.`
+                  : pomoRunning
                   ? `🔥 Đang tập trung tuyệt đối (đã chạy ${elapsedActualMins}p thực tế)!`
                   : isPausedMidSession
-                  ? `⏸ Đang tạm dừng — Đã bảo lưu mốc ${String(Math.floor(pomoSecondsLeft / 60)).padStart(2, '0')}:${String(pomoSecondsLeft % 60).padStart(2, '0')} (thoát ra ngoài không bị reset)`
+                  ? `⏸ Đang tạm dừng — Đã bảo lưu mốc ${clockText} (thoát ra ngoài không bị reset)`
                   : 'Bấm Bắt đầu để bước vào hiệp Pomodoro cho riêng nhiệm vụ này'}
               </div>
               <div className="zen-progress-track" style={{ width: '82%', marginTop: 10 }}>
                 <div
                   className="zen-progress-fill"
                   style={{
-                    width: `${Math.min(
-                      100,
-                      Math.round(
-                        ((pomoTotalSeconds - pomoSecondsLeft) / Math.max(1, pomoTotalSeconds)) * 100
-                      )
-                    )}%`,
+                    width: `${progressPct}%`,
+                    background: isOvertime
+                      ? 'linear-gradient(90deg, #5BAE93, #f0c878)'
+                      : undefined,
                   }}
                 />
               </div>
@@ -225,13 +391,36 @@ export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
                   <>
                     <Play size={18} />
                     <span>
-                      {pomoSecondsLeft < pomoTotalSeconds
-                        ? 'Tiếp Tục Pomodoro'
+                      {elapsedSeconds > 0
+                        ? 'Tiếp Tục Tập Trung'
+                        : timerMode === 'FLOWTIME'
+                        ? 'Bắt Đầu Flowtime Tự Do'
                         : `Bắt Đầu Pomodoro (${pomoSelectedMins} Phút)`}
                     </span>
                   </>
                 )}
               </button>
+
+              {timerMode === 'POMODORO' && (
+                <>
+                  <button
+                    type="button"
+                    className="zen-btn zen-btn-outline"
+                    onClick={() => onExtendPomoMinutes(5)}
+                    title="Cộng thêm 5 phút vào hiệp hiện tại"
+                  >
+                    <Zap size={14} /> +5p
+                  </button>
+                  <button
+                    type="button"
+                    className="zen-btn zen-btn-outline"
+                    onClick={() => onExtendPomoMinutes(10)}
+                    title="Đang vào luồng sâu? Cộng ngay +10p Flow tiếp!"
+                  >
+                    <Zap size={14} /> +10p Flow tiếp
+                  </button>
+                </>
+              )}
 
               <button type="button" className="zen-btn zen-btn-outline" onClick={onResetTimer}>
                 <RotateCcw size={15} />
@@ -247,8 +436,8 @@ export const FocusChamberView: React.FC<FocusChamberViewProps> = ({
                 <Check size={15} />
                 <span>
                   {elapsedActualMins > 0
-                    ? `Hoàn thành hiệp này (+${elapsedActualMins}p thực tế)`
-                    : 'Hoàn thành hiệp này (0p thực tế)'}
+                    ? `Chốt hiệp này (+${formatDurationHM(elapsedActualMins)})`
+                    : 'Chốt hiệp này (0p)'}
                 </span>
               </button>
             </div>
